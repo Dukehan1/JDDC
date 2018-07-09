@@ -215,6 +215,7 @@ class CopynetDecoderRNN(nn.Module):
         cur_attention = torch.tanh(self.attn_combine(torch.cat((attn_applied[0], cur_hidden[0]), 1)))  # (1, hidden_size)
 
         generate_score = torch.exp(self.gen_out(cur_attention).view(-1, 1))  # (dec_vocab_size, 1)
+        '''
         copy_weights = torch.sigmoid(self.copy_out(encoder_outputs))  # (max_length, hidden_size)
         copy_score = torch.exp(torch.matmul(copy_weights, cur_attention.transpose(0, 1)).view(-1, 1))  # (max_length, 1)
 
@@ -230,6 +231,8 @@ class CopynetDecoderRNN(nn.Module):
         prob_total = torch.cat((prob_g_one_hot, prob_c_one_hot), 0)  # (dec_vocab_size + max_length, vocab_size)
         output = torch.sum(prob_total, dim=0)  # (vocab_size, )
         output = torch.log(output / torch.sum(output, dim=0))  # (vocab_size, )
+        '''
+        output = F.log_softmax(generate_score.view(-1))  # (dec_vocab_size, )
 
         _, cur_last_id = torch.max(output, 0)
         cur_last_id = cur_last_id.detach()  # detach from history
@@ -314,10 +317,7 @@ def train(training_pairs, encoder, decoder, encoder_optimizer, decoder_optimizer
             # Teacher forcing: Feed the target as the next input
             for di in range(target_length):
                 decoder_output, copy_tuple = decoder(decoder_input, input_tensor, copy_tuple, encoder_outputs)
-                print torch.masked_select(decoder_output, decoder_output.ne(float('-inf'))).view(1, -1)
-                loss += criterion(torch.masked_select(decoder_output, decoder_output.ne(float('-inf'))).view(1, -1),
-                                  target_tensor[di])  # 去掉decoder_output中的-inf
-                print loss
+                loss += criterion(decoder_output, target_tensor[di])  # 去掉decoder_output中的-inf
 
                 decoder_input = target_tensor[di]  # Teacher forcing
 
@@ -325,8 +325,7 @@ def train(training_pairs, encoder, decoder, encoder_optimizer, decoder_optimizer
             # Without teacher forcing: use its own predictions as the next input
             for di in range(target_length):
                 decoder_output, copy_tuple = decoder(decoder_input, input_tensor, copy_tuple, encoder_outputs)
-                loss += criterion(torch.masked_select(decoder_output, decoder_output.ne(float('-inf'))).view(1, -1),
-                                  target_tensor[di])  # 去掉decoder_output中的-inf
+                loss += criterion(decoder_output, target_tensor[di])  # 去掉decoder_output中的-inf
 
                 topv, topi = decoder_output.topk(1)
                 decoder_input = topi.squeeze().detach()  # detach from history as input
@@ -334,8 +333,8 @@ def train(training_pairs, encoder, decoder, encoder_optimizer, decoder_optimizer
                     break
 
     loss.backward()
-    print map(lambda x: x.grad, encoder.parameters())
-    print map(lambda x: x.grad, decoder.parameters())
+    # print map(lambda x: x.grad, encoder.parameters())
+    # print map(lambda x: x.grad, decoder.parameters())
     torch.nn.utils.clip_grad_norm_(encoder.parameters(), 5)
     torch.nn.utils.clip_grad_norm_(decoder.parameters(), 5)
 
@@ -350,8 +349,8 @@ def trainIters(encoder, decoder, n_iters, learning_rate, batch_size, print_every
     print_loss_total = 0  # Reset every print_every
     plot_loss_total = 0  # Reset every plot_every
     data = []
-    encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
+    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
+    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
     for pair in pairs:
         data.append(tensorsFromPair(pair))
     criterion = nn.NLLLoss()
@@ -376,23 +375,6 @@ def trainIters(encoder, decoder, n_iters, learning_rate, batch_size, print_every
             plot_losses.append(plot_loss_avg)
             plot_loss_total = 0
 
-    showPlot(plot_losses)
-
-
-import matplotlib.pyplot as plt
-
-plt.switch_backend('agg')
-import matplotlib.ticker as ticker
-
-
-def showPlot(points):
-    plt.figure()
-    fig, ax = plt.subplots()
-    # this locator puts ticks at regular intervals
-    loc = ticker.MultipleLocator(base=0.2)
-    ax.yaxis.set_major_locator(loc)
-    plt.plot(points)
-
 
 def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
     with torch.no_grad():
@@ -414,8 +396,9 @@ def evaluate(encoder, decoder, sentence, max_length=MAX_LENGTH):
 
         decoded_words = []
         init_attention = torch.zeros(1, encoder.hidden_size)
-        copy_tuple = CopyNetWrapperState(-1, 0, encoder_hidden, init_attention)
+        copy_tuple = CopyNetWrapperState(-1, encoder_hidden, init_attention)
 
+        # TODO: Beam search
         for di in range(max_length):
             decoder_output, copy_tuple = decoder(
                 decoder_input, input_tensor, copy_tuple, encoder_outputs)
@@ -436,7 +419,7 @@ def evaluateRandomly(encoder, decoder, n=10):
         pair = random.choice(pairs)
         print('>', pair[0])
         print('=', pair[1])
-        output_words, attentions = evaluate(encoder, decoder, pair[0])
+        output_words = evaluate(encoder, decoder, pair[0])
         output_sentence = ' '.join(output_words)
         print('<', output_sentence)
         print('')
@@ -444,7 +427,7 @@ def evaluateRandomly(encoder, decoder, n=10):
 
 n_epochs = 100
 batch_size = 2
-lr = 0.0001
+lr = 0.001
 hidden_size = 256
 
 
