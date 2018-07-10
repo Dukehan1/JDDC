@@ -4,28 +4,13 @@ import jieba
 import numpy as np
 import re
 import random
-import time
-import math
 import torch
 import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def asMinutes(s):
-    m = math.floor(s / 60)
-    s -= m * 60
-    return '%dm %ds' % (m, s)
-
-
-def timeSince(since, percent):
-    now = time.time()
-    s = now - since
-    es = s / (percent)
-    rs = es - s
-    return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
 
 UNK_token = 0
@@ -428,7 +413,7 @@ def evaluateRandomly(encoder, decoder, n=10):
 
 n_epochs = 100
 batch_size = 1
-lr = 0.01
+lr = 0.001
 hidden_size = 256
 
 # 共用一套embedding
