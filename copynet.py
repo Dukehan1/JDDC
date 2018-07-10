@@ -11,7 +11,6 @@ import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -212,27 +211,29 @@ class CopynetDecoderRNN(nn.Module):
         attn_weights = F.softmax(torch.bmm(self.attn(cur_hidden[0]).view(1, 1, -1),
                                            encoder_outputs.unsqueeze(0).transpose(1, 2)), dim=2)  # (1, 1, max_length)
         attn_applied = torch.bmm(attn_weights, encoder_outputs.unsqueeze(0))  # (1, 1, hidden_size)
-        cur_attention = torch.tanh(self.attn_combine(torch.cat((attn_applied[0], cur_hidden[0]), 1)))  # (1, hidden_size)
+        cur_attention = torch.tanh(
+            self.attn_combine(torch.cat((attn_applied[0], cur_hidden[0]), 1)))  # (1, hidden_size)
 
-        generate_score = torch.exp(self.gen_out(cur_attention).view(-1, 1))  # (dec_vocab_size, 1)
-        '''
-        copy_weights = torch.sigmoid(self.copy_out(encoder_outputs))  # (max_length, hidden_size)
-        copy_score = torch.exp(torch.matmul(copy_weights, cur_attention.transpose(0, 1)).view(-1, 1))  # (max_length, 1)
+        generate_score = self.gen_out(cur_attention).view(-1, 1)  # (dec_vocab_size, 1)
 
-        encoder_input_mask = torch.zeros(input_length, self.vocab_size).scatter_(1, encoder_input_ids, 1)  # (length, vocab_size)
-        padding_encoder_input_mask = torch.cat((encoder_input_mask,
-                                                torch.zeros(self.max_length - input_length, self.vocab_size)), 0)  # (max_length, vocab_size)
-        prob_c_one_hot = copy_score * padding_encoder_input_mask  # (max_length, vocab_size)
+        copy_weights = torch.sigmoid(self.copy_out(encoder_outputs[:input_length]))  # (length, hidden_size)
+        copy_score = torch.matmul(copy_weights, cur_attention.transpose(0, 1)).view(-1, 1)  # (length, 1)
+
+        score = F.log_softmax(torch.cat((generate_score, copy_score), 0), dim=0)
+        generate_score, copy_score = torch.split(score, (self.dec_vocab_size, input_length))
+
+        encoder_input_mask = torch.zeros(input_length, self.vocab_size).scatter_(1, encoder_input_ids,
+                                                                                 1)  # (length, vocab_size)
+        prob_c_one_hot = copy_score * encoder_input_mask  # (length, vocab_size)
 
         gen_output_mask = torch.zeros(self.dec_vocab_size, self.vocab_size). \
-            scatter_(1, torch.tensor(range(self.dec_vocab_size), dtype=torch.long).view(-1, 1), 1)  # (dec_vocab_size, vocab_size)
+            scatter_(1, torch.tensor(range(self.dec_vocab_size), dtype=torch.long).view(-1, 1),
+                     1)  # (dec_vocab_size, vocab_size)
         prob_g_one_hot = generate_score * gen_output_mask  # (dec_vocab_size, vocab_size)
 
-        prob_total = torch.cat((prob_g_one_hot, prob_c_one_hot), 0)  # (dec_vocab_size + max_length, vocab_size)
+        prob_total = torch.cat((prob_g_one_hot, prob_c_one_hot), 0)  # (dec_vocab_size + length, vocab_size)
         output = torch.sum(prob_total, dim=0)  # (vocab_size, )
-        output = torch.log(output / torch.sum(output, dim=0))  # (vocab_size, )
-        '''
-        output = F.log_softmax(generate_score.view(-1))  # (dec_vocab_size, )
+        output[output == 0] = float('-inf')  # 将概率为0的项替换成-inf
 
         _, cur_last_id = torch.max(output, 0)
         cur_last_id = cur_last_id.detach()  # detach from history
@@ -426,10 +427,9 @@ def evaluateRandomly(encoder, decoder, n=10):
 
 
 n_epochs = 100
-batch_size = 2
-lr = 0.001
+batch_size = 1
+lr = 0.01
 hidden_size = 256
-
 
 # 共用一套embedding
 embedding = nn.Embedding(lang.n_words, hidden_size).to(device)
@@ -437,8 +437,6 @@ encoder1 = EncoderRNN(lang.n_words, hidden_size, embedding).to(device)
 attn_decoder1 = CopynetDecoderRNN(hidden_size, lang.n_words_for_decoder, lang.n_words, embedding, dropout_p=0.1).to(
     device)
 
-
 trainIters(encoder1, attn_decoder1, n_epochs, lr, batch_size, print_every=1)
-
 
 evaluateRandomly(encoder1, attn_decoder1)
