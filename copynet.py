@@ -1,5 +1,4 @@
 # -*- coding: UTF-8 -*-
-from io import open
 import jieba
 import numpy as np
 import re
@@ -8,14 +7,17 @@ import torch
 import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from torch.nn.utils import clip_grad_norm_
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-UNK_token = 0
-SOS_token = 1
-EOS_token = 2
+PAD_token = 0
+UNK_token = 1
+SOS_token = 2
+EOS_token = 3
 
 
 class Lang:
@@ -23,8 +25,8 @@ class Lang:
         self.name = name
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "UNK", 1: "SOS", 2: "EOS"}
-        self.n_words = 3  # Count UNK, SOS and EOS
+        self.index2word = {1: "<UNK>", 2: "<SOS>", 3: "<EOS>"}
+        self.n_words = 4  # Count PAD, UNK, SOS and EOS
         self.n_words_for_decoder = self.n_words
 
     def addSentence(self, sentence):
@@ -46,27 +48,33 @@ class Lang:
 
 
 # Regular expressions used to tokenize.
-_DIGIT_RE = re.compile("\d")
+_DIGIT_RE = re.compile("\d+")
 
 
-def basic_tokenizer(sentence):
+def word_tokenizer(sentence):
+    # word level
+    sentence = re.sub(_DIGIT_RE, "0", sentence)
+    tokens = list(jieba.cut(sentence))
+    tokens = [word.encode('utf-8') for word in tokens if word]
+    return tokens
+
+
+def char_tokenizer(sentence):
     # char level
-    words = []
-    sentence = list(jieba.cut(sentence))
-    for i in range(len(sentence)):
-        words.extend(sentence[i])
-    return [w.encode('utf-8') for w in words if w]
+    sentence = re.sub(_DIGIT_RE, "0", sentence)
+    tokens = list(sentence.decode('utf-8'))
+    tokens = [word.encode('utf-8') for word in tokens if word]
+    return tokens
 
 
-def prepare_data(tokenizer=None):
+def prepare_data(tokenizer):
     # 生成词表，前半部分仅供decoder使用，整体供encoder使用
     lang = Lang('zh-cn')
     files = ['data/train.dec', 'data/train.enc']
     for f in files:
         lines = open(f).read().strip().split('\n')
         for line in lines:
-            tokens = tokenizer(line) if tokenizer else basic_tokenizer(line)
-            tokens = map(lambda w: re.sub(_DIGIT_RE, "0", w), tokens)
+            tokens = tokenizer(line)
             lang.addSentence(tokens)
         # 记录Decoder词表的大小
         if f == 'data/train.dec':
@@ -79,15 +87,14 @@ def prepare_data(tokenizer=None):
         data[f] = []
         lines = open(f).read().strip().split('\n')
         for line in lines:
-            tokens = tokenizer(line) if tokenizer else basic_tokenizer(line)
-            tokens = list(map(lambda w: re.sub(_DIGIT_RE, "0", w), tokens))
+            tokens = tokenizer(line)
             data[f].append(tokens)
 
     return lang, data
 
 
 def indexesFromSentence(lang, sentence):
-    return [lang.word2index[word] if word in lang.word2index else 0 for word in sentence]
+    return [lang.word2index[word] if word in lang.word2index else UNK_token for word in sentence]
 
 
 def tensorFromSentence(lang, sentence):
@@ -102,11 +109,11 @@ def tensorsFromPair(pair):
     return (input_tensor, target_tensor)
 
 
-lang, data = prepare_data()
+lang, data = prepare_data(char_tokenizer)
 pairs = []
 length = []
 for i in range(5):
-    # for i in range(len(data['data/train.enc'])):
+# for i in range(len(data['data/train.enc'])):
     pairs.append((data['data/train.enc'][i], data['data/train.dec'][i]))
     length.append(len(data['data/train.enc'][i]))
 print 'max input length: ', max(length)
