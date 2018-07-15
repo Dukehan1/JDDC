@@ -110,7 +110,7 @@ def tensorsFromPair(pair):
 lang, data = prepare_data(char_tokenizer)
 pairs = []
 length = []
-for i in range(5):
+for i in range(1):
     # for i in range(len(data['data/train.enc'])):
     pairs.append((data['data/train.enc'][i], data['data/train.dec'][i]))
     length.append(len(data['data/train.enc'][i]))
@@ -181,7 +181,7 @@ class CopynetDecoderRNN(nn.Module):
         rou[torch.isnan(rou)] = 0  # (b, l)
         selective_read = torch.bmm(rou.unsqueeze(1), encoder_outputs)  # (b, 1, hidden_size)
 
-        input = self.dropout(input)  # (b, 1, embed)
+        # input = self.dropout(input)  # (b, 1, embed)
 
         input = torch.cat((input, attention, selective_read), 2)  # (b, 1, hidden + embed)
         _, cur_hidden = self.gru(input, hidden.transpose(0, 1))
@@ -199,7 +199,7 @@ class CopynetDecoderRNN(nn.Module):
         copy_weights = torch.sigmoid(self.copy_out(encoder_outputs))  # (b, l, hidden)
         copy_score = torch.bmm(copy_weights, cur_attention.transpose(1, 2)).squeeze(2)  # (b, l)
 
-        score = F.log_softmax(torch.cat((generate_score, copy_score), 1), dim=1)
+        score = F.softmax(torch.cat((generate_score, copy_score), 1), dim=1)
         generate_score, copy_score = torch.split(score, (self.dec_vocab_size, l), 1)
 
         encoder_input_mask = torch.zeros(b, l, self.vocab_size).scatter_(2, encoder_input_ids.unsqueeze(2),
@@ -214,6 +214,7 @@ class CopynetDecoderRNN(nn.Module):
         prob_total = torch.cat((prob_g_one_hot, prob_c_one_hot), 1)  # (b, dec_vocab_size + l, vocab_size)
         output = torch.sum(prob_total, dim=1)  # (b, vocab_size)
         output[output == 0] = float('-inf')  # 将概率为0的项替换成-inf
+        output = torch.log(output)  # (b, vocab_size)
 
         # output = F.log_softmax(generate_score, dim=1)  # (b, dec_vocab_size)
         return output, cur_hidden, cur_attention
@@ -307,7 +308,7 @@ def trainIters(embedding, encoder, decoder, n_iters, learning_rate, batch_size, 
     plot_loss_total = 0  # Reset every plot_every
     data = []
     optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": encoder.parameters()},
-                            {"params": decoder.parameters()}], lr=learning_rate)
+                            {"params": decoder.parameters()}], lr=learning_rate, amsgrad=True)
     for pair in pairs:
         data.append(tensorsFromPair(pair))
     criterion = nn.NLLLoss()
@@ -391,8 +392,8 @@ def evaluateRandomly(embedding, encoder, decoder, n=10):
         print('')
 
 
-n_epochs = 100
-batch_size = 2
+n_epochs = 500
+batch_size = 1
 lr = 0.001
 embed_size = 200
 hidden_size = 256
