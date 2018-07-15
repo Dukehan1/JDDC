@@ -202,12 +202,12 @@ class CopynetDecoderRNN(nn.Module):
         score = F.softmax(torch.cat((generate_score, copy_score), 1), dim=1)
         generate_score, copy_score = torch.split(score, (self.dec_vocab_size, l), 1)
 
-        encoder_input_mask = torch.zeros(b, l, self.vocab_size).scatter_(2, encoder_input_ids.unsqueeze(2),
+        encoder_input_mask = torch.zeros(b, l, self.vocab_size, device=device).scatter_(2, encoder_input_ids.unsqueeze(2),
                                                                          1)  # (b, l, vocab_size)
         prob_c_one_hot = copy_score.unsqueeze(2) * encoder_input_mask  # (b, l, vocab_size)
 
-        gen_output_mask = torch.zeros(b, self.dec_vocab_size, self.vocab_size). \
-            scatter_(2, torch.tensor(range(self.dec_vocab_size), dtype=torch.long).view(1, -1, 1).expand(b, -1, 1),
+        gen_output_mask = torch.zeros(b, self.dec_vocab_size, self.vocab_size, device=device). \
+            scatter_(2, torch.tensor(range(self.dec_vocab_size), dtype=torch.long, device=device).view(1, -1, 1).expand(b, -1, 1),
                      1)  # (b, dec_vocab_size, vocab_size)
         prob_g_one_hot = generate_score.unsqueeze(2) * gen_output_mask  # (b, dec_vocab_size, vocab_size)
 
