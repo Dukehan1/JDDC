@@ -181,7 +181,7 @@ class CopynetDecoderRNN(nn.Module):
         rou[torch.isnan(rou)] = 0  # (b, l)
         selective_read = torch.bmm(rou.unsqueeze(1), encoder_outputs)  # (b, 1, hidden_size)
 
-        # input = self.dropout(input)  # (b, 1, embed)
+        input = self.dropout(input)  # (b, 1, embed)
 
         input = torch.cat((input, attention, selective_read), 2)  # (b, 1, hidden + embed)
         _, cur_hidden = self.gru(input, hidden.transpose(0, 1))
@@ -215,6 +215,7 @@ class CopynetDecoderRNN(nn.Module):
         output = torch.sum(prob_total, dim=1)  # (b, vocab_size)
         output[output == 0] = float('-inf')  # 将概率为0的项替换成-inf
         output = torch.log(output)  # (b, vocab_size)
+        output[torch.isnan(output)] = float('-inf')  # 将nan替换成-inf
 
         # output = F.log_softmax(generate_score, dim=1)  # (b, dec_vocab_size)
         return output, cur_hidden, cur_attention
@@ -392,7 +393,7 @@ def evaluateRandomly(embedding, encoder, decoder, n=10):
         print('')
 
 
-n_epochs = 500
+n_epochs = 100
 batch_size = 1
 lr = 0.001
 embed_size = 200
