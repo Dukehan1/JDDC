@@ -53,33 +53,33 @@ def word_tokenizer(sentence):
     # word level
     sentence = re.sub(_DIGIT_RE, "0", sentence)
     tokens = list(jieba.cut(sentence))
-    tokens = [word.encode('utf-8') for word in tokens if word]
+    tokens = [word for word in tokens if word]
     return tokens
 
 
 def char_tokenizer(sentence):
     # char level
     sentence = re.sub(_DIGIT_RE, "0", sentence)
-    tokens = list(sentence.decode('utf-8'))
-    tokens = [word.encode('utf-8') for word in tokens if word]
+    tokens = list(sentence)
+    tokens = [word for word in tokens if word]
     return tokens
 
 
 def prepare_data(tokenizer):
     # 生成词表，前半部分仅供decoder使用，整体供encoder使用
     lang = Lang('zh-cn')
-    files = ['data/train.dec', 'data/train.enc']
+    files = ['data/trainAnswers.txt', 'data/devAnswers.txt', 'data/trainQuestions.txt', 'data/devQuestions.txt']
     for f in files:
         lines = open(f).read().strip().split('\n')
         for line in lines:
             tokens = tokenizer(line)
             lang.addSentence(tokens)
         # 记录Decoder词表的大小
-        if f == 'data/train.dec':
+        if f == 'data/devAnswers.txt':
             lang.updateDecoderWords()
 
     # data_to_token_ids
-    files = ['data/train.enc', 'data/train.dec', 'data/test.enc', 'data/test.dec']
+    files = ['data/trainAnswers.txt', 'data/devAnswers.txt', 'data/trainQuestions.txt', 'data/devQuestions.txt']
     data = {}
     for f in files:
         data[f] = []
@@ -107,19 +107,28 @@ def tensorsFromPair(pair):
     return (input_tensor, target_tensor)
 
 
-lang, data = prepare_data(char_tokenizer)
+lang, data = prepare_data(word_tokenizer)
 pairs = []
 length = []
 for i in range(1):
-    # for i in range(len(data['data/train.enc'])):
-    pairs.append((data['data/train.enc'][i], data['data/train.dec'][i]))
-    length.append(len(data['data/train.enc'][i]))
-print 'max input length: ', max(length)
-# print pairs[0]
-# print tensorsFromPair(pairs[0])
+# for i in range(len(data['data/trainQuestions.txt'])):
+    pairs.append((data['data/trainQuestions.txt'][i], data['data/trainAnswers.txt'][i]))
+    length.append(len(data['data/trainAnswers.txt'][i]))
+'''
+a = map(lambda x: (len(x), x), lang.word2index)
+for l, w in a:
+    if l >= 12:
+        print(w)
+'''
+print('dec_vocab_size: ', lang.n_words_for_decoder)
+print('vocab_size: ', lang.n_words)
+print('max_word_length: ', max(map(lambda x: len(x), lang.word2index)))
+print('max_output_length: ', max(length))
+# print(pairs[0])
+# print(tensorsFromPair(pairs[0]))
 
 
-# 实际输入的序列会多一个终止token
+# 实际的序列会多一个终止token
 MAX_LENGTH = max(length) + 1
 
 
@@ -291,9 +300,9 @@ def train(input, input_lens, target, target_lens, embedding, encoder, decoder, o
             decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
 
     loss.backward()
-    # print map(lambda x: x.grad, embedding.parameters())
-    # print map(lambda x: x.grad, encoder.parameters())
-    # print map(lambda x: x.grad, decoder.parameters())
+    # print(map(lambda x: x.grad, embedding.parameters()))
+    # print(map(lambda x: x.grad, encoder.parameters()))
+    # print(map(lambda x: x.grad, decoder.parameters()))
     clip_grad_norm_(embedding.parameters(), 5)
     clip_grad_norm_(encoder.parameters(), 5)
     clip_grad_norm_(decoder.parameters(), 5)
@@ -315,9 +324,9 @@ def trainIters(embedding, encoder, decoder, n_iters, learning_rate, batch_size, 
     criterion = nn.NLLLoss()
 
     for iter in range(1, n_iters + 1):
-        print "======================iter%s============================" % iter
+        print("======================iter%s============================" % iter)
         for i, training_pairs in enumerate(get_minibatches(data, batch_size)):
-            print "batch: ", i
+            print("batch: ", i)
             # 排序并padding
             training_pairs = sorted(training_pairs, cmp=lambda x, y: cmp(len(x[0]), len(y[0])), reverse=True)
             enc_lens = map(lambda x: len(x[0]), training_pairs)

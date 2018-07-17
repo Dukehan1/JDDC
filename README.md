@@ -1,5 +1,4 @@
 # requirement
-python2.7  
-pytorch0.4  
-numpy  
+python3.6
+pytorch0.4
 jieba  
