@@ -1,4 +1,4 @@
 # requirement
-python3.6
-pytorch0.4
+python3.6  
+pytorch0.4  
 jieba  
