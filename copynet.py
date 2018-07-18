@@ -70,7 +70,7 @@ def prepare_data(tokenizer):
     lang = Lang('zh-cn')
     files = ['data/trainAnswers.txt', 'data/devAnswers.txt', 'data/trainQuestions.txt', 'data/devQuestions.txt']
     for f in files:
-        lines = open(f).read().strip().split('\n')
+        lines = open(f, encoding="utf-8").read().strip().split('\n')
         for line in lines:
             tokens = tokenizer(line)
             lang.addSentence(tokens)
@@ -83,7 +83,7 @@ def prepare_data(tokenizer):
     data = {}
     for f in files:
         data[f] = []
-        lines = open(f).read().strip().split('\n')
+        lines = open(f, encoding="utf-8").read().strip().split('\n')
         for line in lines:
             tokens = tokenizer(line)
             data[f].append(tokens)
@@ -117,7 +117,7 @@ for i in range(1):
 '''
 a = map(lambda x: (len(x), x), lang.word2index)
 for l, w in a:
-    if l >= 12:
+    if l >= 5:
         print(w)
 '''
 print('dec_vocab_size: ', lang.n_words_for_decoder)
@@ -328,9 +328,9 @@ def trainIters(embedding, encoder, decoder, n_iters, learning_rate, batch_size, 
         for i, training_pairs in enumerate(get_minibatches(data, batch_size)):
             print("batch: ", i)
             # 排序并padding
-            training_pairs = sorted(training_pairs, cmp=lambda x, y: cmp(len(x[0]), len(y[0])), reverse=True)
-            enc_lens = map(lambda x: len(x[0]), training_pairs)
-            dec_lens = map(lambda x: len(x[1]), training_pairs)
+            training_pairs = sorted(training_pairs, key=lambda x: len(x[0]), reverse=True)
+            enc_lens = list(map(lambda x: len(x[0]), training_pairs))
+            dec_lens = list(map(lambda x: len(x[1]), training_pairs))
             enc_max_len = max(enc_lens)
             dec_max_len = max(dec_lens)
             enc = []
@@ -410,7 +410,7 @@ hidden_size = 256
 
 # 共用一套embedding
 embedding = nn.Embedding(lang.n_words, embed_size, padding_idx=0).to(device)
-encoder = EncoderRNN(embed_size, lang.n_words, hidden_size / 2).to(device)
+encoder = EncoderRNN(embed_size, lang.n_words, hidden_size // 2).to(device)
 attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, lang.n_words_for_decoder, lang.n_words, dropout_p=0.1).to(
     device)
 
