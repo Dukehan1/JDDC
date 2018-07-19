@@ -9,6 +9,7 @@ from torch import optim
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from torch.nn.utils import clip_grad_norm_
+import subprocess
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -23,7 +24,7 @@ class Lang:
         self.name = name
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "<PAD>", 1: "<UNK>", 2: "<SOS>", 3: "<EOS>"}
+        self.index2word = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
         self.n_words = 4  # Count PAD, UNK, SOS and EOS
         self.n_words_for_decoder = self.n_words
 
@@ -35,7 +36,7 @@ class Lang:
         if word not in self.word2index:
             self.word2index[word] = self.n_words
             self.word2count[word] = 1
-            self.index2word[self.n_words] = word
+            self.index2word.append(word)
             self.n_words += 1
         else:
             self.word2count[word] += 1
@@ -65,71 +66,73 @@ def char_tokenizer(sentence):
     return tokens
 
 
-def prepare_data(tokenizer):
+def prepare_vocabulary(tokenizer, cut=3):
     # 生成词表，前半部分仅供decoder使用，整体供encoder使用
     lang = Lang('zh-cn')
-    files = ['data/trainAnswers.txt', 'data/devAnswers.txt', 'data/trainQuestions.txt', 'data/devQuestions.txt']
+    files = ['data/trainAnswers.txt', 'data/trainQuestions.txt']
     for f in files:
         lines = open(f, encoding="utf-8").read().strip().split('\n')
         for line in lines:
             tokens = tokenizer(line)
             lang.addSentence(tokens)
         # 记录Decoder词表的大小
-        if f == 'data/devAnswers.txt':
+        if f == 'data/trainAnswers.txt':
             lang.updateDecoderWords()
 
+    # 削减词汇表
+    dec = []
+    rest = []
+    for k, v in enumerate(lang.index2word):
+        if v in lang.word2count:
+            if k < lang.n_words_for_decoder:
+                dec.append((v, lang.word2count[v]))
+            else:
+                rest.append((v, lang.word2count[v]))
+    dec = list(filter(lambda x: x[1] > cut, dec))
+    rest = list(filter(lambda x: x[1] > cut, rest))
+    lang.n_words_for_decoder = 4 + len(dec)
+    lang.n_words = 4 + len(dec) + len(rest)
+    lang.word2index = {}
+    lang.word2count = {}
+    lang.index2word = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
+    for i in dec + rest:
+        lang.word2index[i[0]] = len(lang.index2word)
+        lang.word2count[i[0]] = i[1]
+        lang.index2word.append(i[0])
+
+    return lang
+
+
+def prepare_data(tokenizer):
     # data_to_token_ids
     files = ['data/trainAnswers.txt', 'data/devAnswers.txt', 'data/trainQuestions.txt', 'data/devQuestions.txt']
     data = {}
     for f in files:
         data[f] = []
+        tokenized_sentence = []
         lines = open(f, encoding="utf-8").read().strip().split('\n')
         for line in lines:
             tokens = tokenizer(line)
             data[f].append(tokens)
+            tokenized_sentence.append(' '.join(tokens))
+        # 记录devAnswers，供bleu使用
+        if f == 'data/devAnswers.txt':
+            with open('bleu/gold', 'w', encoding='utf-8') as gw:
+                gw.write('\n'.join(tokenized_sentence))
 
-    return lang, data
+    return data
 
 
 def indexesFromSentence(lang, sentence):
-    return [lang.word2index[word] if word in lang.word2index else UNK_token for word in sentence]
+    result = [lang.word2index[word] if word in lang.word2index else UNK_token for word in sentence]
+    result.append(EOS_token)
+    return result
 
 
-def tensorFromSentence(lang, sentence):
-    indexes = indexesFromSentence(lang, sentence)
-    indexes.append(EOS_token)
-    return indexes
-
-
-def tensorsFromPair(pair):
-    input_tensor = tensorFromSentence(lang, pair[0])
-    target_tensor = tensorFromSentence(lang, pair[1])
-    return (input_tensor, target_tensor)
-
-
-lang, data = prepare_data(word_tokenizer)
-pairs = []
-length = []
-for i in range(1):
-# for i in range(len(data['data/trainQuestions.txt'])):
-    pairs.append((data['data/trainQuestions.txt'][i], data['data/trainAnswers.txt'][i]))
-    length.append(len(data['data/trainAnswers.txt'][i]))
-'''
-a = map(lambda x: (len(x), x), lang.word2index)
-for l, w in a:
-    if l >= 5:
-        print(w)
-'''
-print('dec_vocab_size: ', lang.n_words_for_decoder)
-print('vocab_size: ', lang.n_words)
-print('max_word_length: ', max(map(lambda x: len(x), lang.word2index)))
-print('max_output_length: ', max(length))
-# print(pairs[0])
-# print(tensorsFromPair(pairs[0]))
-
-
-# 实际的序列会多一个终止token
-MAX_LENGTH = max(length) + 1
+def indexesFromPair(lang, pair):
+    input = indexesFromSentence(lang, pair[0])
+    target = indexesFromSentence(lang, pair[1])
+    return input, target
 
 
 class EncoderRNN(nn.Module):
@@ -312,20 +315,21 @@ def train(input, input_lens, target, target_lens, embedding, encoder, decoder, o
     return loss.item() / len(target_lens)
 
 
-def trainIters(embedding, encoder, decoder, n_iters, learning_rate, batch_size, print_every=1000, plot_every=100):
+def trainIters(embedding, encoder, decoder, train_pairs, max_length, n_iters, learning_rate, batch_size, print_every=1000, plot_every=100):
     plot_losses = []
     print_loss_total = 0  # Reset every print_every
     plot_loss_total = 0  # Reset every plot_every
-    data = []
+    train_data = []
+    best_bleu_score = 0.0
     optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": encoder.parameters()},
                             {"params": decoder.parameters()}], lr=learning_rate, amsgrad=True)
-    for pair in pairs:
-        data.append(tensorsFromPair(pair))
+    for pair in train_pairs:
+        train_data.append(indexesFromPair(lang, pair))
     criterion = nn.NLLLoss()
 
     for iter in range(1, n_iters + 1):
         print("======================iter%s============================" % iter)
-        for i, training_pairs in enumerate(get_minibatches(data, batch_size)):
+        for i, training_pairs in enumerate(get_minibatches(train_data, batch_size)):
             print("batch: ", i)
             # 排序并padding
             training_pairs = sorted(training_pairs, key=lambda x: len(x[0]), reverse=True)
@@ -356,57 +360,162 @@ def trainIters(embedding, encoder, decoder, n_iters, learning_rate, batch_size, 
             plot_losses.append(plot_loss_avg)
             plot_loss_total = 0
 
+        bleu_score, _ = evaluate(embedding, encoder, decoder, dev_pairs, max_length)
+        bleu_score = bleu_score if bleu_score is not None else 0
+        print('bleu_socre: {0}'.format(bleu_score))
+        if bleu_score >= best_bleu_score:
+            best_bleu_score = bleu_score
+            torch.save(encoder.state_dict(), 'model/encoder')
+            torch.save(decoder.state_dict(), 'model/decoder')
+            torch.save(embedding.state_dict(), 'model/embedding')
+            print('new model saved.')
 
-def evaluate(embedding, encoder, decoder, sentence, max_length=MAX_LENGTH):
+
+class Node(object):
+    def __init__(self, parent, state, value, cost, extras):
+        super(Node, self).__init__()
+        self.value = value
+        self.parent = parent # parent Node, None for root
+        self.state = state if state is not None else None # recurrent layer hidden state
+        self.cum_cost = parent.cum_cost + cost if parent else cost # e.g. -log(p) of sequence up to current node (including)
+        self.length = 1 if parent is None else parent.length + 1
+        self.extras = extras # can hold, for example, attention weights
+        self._sequence = None
+
+    def to_sequence(self):
+        # Return sequence of nodes from root to current node.
+        if not self._sequence:
+            self._sequence = []
+            current_node = self
+            while current_node:
+                self._sequence.insert(0, current_node)
+                current_node = current_node.parent
+        return self._sequence
+
+    def to_sequence_of_values(self):
+        return [s.value for s in self.to_sequence()]
+
+    def to_sequence_of_extras(self):
+        return [s.extras for s in self.to_sequence()]
+
+
+def beam_search(encoder_outputs, decoder_hidden, decoder_attention, decoder, embedding, input, max_length,
+                start_id=SOS_token, end_id=EOS_token, beam_width=2, num_hypotheses=1):
+    next_fringe = [Node(parent=None, state=decoder_hidden, value=start_id, cost=0.0, extras=None)]
+    hypotheses = []
+
+    for _ in range(max_length):
+
+        fringe = []
+        for n in next_fringe:
+            if n.value == end_id:
+                hypotheses.append(n)
+            else:
+                fringe.append(n)
+
+        if not fringe or len(hypotheses) >= num_hypotheses:
+            break
+
+        decoder_input_ids = [n.value for n in fringe]
+        decoder_hiddens = torch.cat([n.state for n in fringe])
+
+        Y_t = []
+        p_t = []
+        extras_t = []
+        state_t = []
+        for i in range(len(decoder_input_ids)):
+            decoder_input_id = torch.tensor([[decoder_input_ids[i]]], dtype=torch.long, device=device)
+            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, embedding(decoder_input_id),
+                                                                                    encoder_outputs, input, decoder_hiddens[i].view(1,1,-1),
+                                                                                    decoder_attention)
+            topv, topi = decoder_output.data.topk(beam_width)
+            Y_t.append(topi.tolist()[0])
+            p_t.append(F.softmax(decoder_output, dim=0))
+            state_t.append(decoder_hidden)
+            extras_t.append(decoder_attention)
+
+        next_fringe = []
+        for Y_t_n, p_t_n, extras_t_n, state_t_n, n in zip(Y_t, p_t, extras_t, state_t, fringe):
+            Y_nll_t_n = -np.log(p_t_n[0][Y_t_n])
+            for y_t_n, y_nll_t_n in zip(Y_t_n, Y_nll_t_n):
+                n_new = Node(parent=n, state=state_t_n, value=y_t_n, cost=y_nll_t_n, extras=extras_t_n)
+                next_fringe.append(n_new)
+        next_fringe = sorted(next_fringe, key=lambda n: n.cum_cost)[:beam_width] # may move this into loop to save memory
+
+    hypotheses.sort(key=lambda n: n.cum_cost)
+    return hypotheses[:num_hypotheses]
+
+
+def evaluate(embedding, encoder, decoder, dev_pairs, max_length, bms=False):
     with torch.no_grad():
+        output_sentences = []
         # Inference mode (disable dropout)
         encoder.eval()
         decoder.eval()
-        input = torch.tensor([tensorFromSentence(lang, sentence)], dtype=torch.long, device=device)
 
-        encoder_input = embedding(input)  # (1, l, embed)
-        encoder_outputs, decoder_hidden = encoder(encoder_input)  # (1, l, hidden), (1, 1, hidden)
+        for pair in dev_pairs:
+            input = torch.tensor([indexesFromSentence(lang, pair[0])], dtype=torch.long, device=device)
 
-        decoder_input_id = torch.zeros(1, 1, dtype=torch.long, device=device).fill_(SOS_token)  # (1, 1)
-        decoder_input = embedding(decoder_input_id)  # (1, 1, embed)
-        decoder_attention = torch.zeros(1, 1, decoder.hidden_size, device=device)  # (1, 1, hidden)
+            encoder_input = embedding(input)  # (1, l, embed)
+            encoder_outputs, decoder_hidden = encoder(encoder_input)  # (1, l, hidden), (1, 1, hidden)
 
-        decoded_words = []
-
-        # TODO: Beam search
-        for di in range(max_length):
-            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, decoder_input,
-                                                                        encoder_outputs, input, decoder_hidden,
-                                                                        decoder_attention)
-            topv, topi = decoder_output.data.topk(1)
-            if topi.item() == EOS_token:
-                decoded_words.append('<EOS>')
-                break
-            else:
-                decoded_words.append(lang.index2word[topi.item()])
-
-            decoder_input_id = topi.squeeze().detach().view(1, 1)  # (1, 1)
+            decoder_input_id = torch.zeros(1, 1, dtype=torch.long, device=device).fill_(SOS_token)  # (1, 1)
             decoder_input = embedding(decoder_input_id)  # (1, 1, embed)
+            decoder_attention = torch.zeros(1, 1, decoder.hidden_size, device=device)  # (1, 1, hidden)
 
-        return decoded_words
+            decoded_words = []
+
+            if not bms:
+                for di in range(max_length):
+                    decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, decoder_input,
+                                                                                encoder_outputs, input, decoder_hidden,
+                                                                                decoder_attention)
+                    topv, topi = decoder_output.data.topk(1)
+                    if topi.item() == EOS_token:
+                        decoded_words.append('<EOS>')
+                        break
+                    else:
+                        decoded_words.append(lang.index2word[topi.item()])
+
+                    decoder_input_id = topi.squeeze().detach().view(1, 1)  # (1, 1)
+                    decoder_input = embedding(decoder_input_id)  # (1, 1, embed).
+            else:
+                hypotheses = beam_search(encoder_outputs, decoder_hidden, decoder_attention, decoder, embedding, input,
+                                         max_length)
+                for hypothesis in hypotheses:
+                    decoder_indices = hypothesis.to_sequence_of_values()
+                    decoded_words.append([lang.index2word[i] for i in decoder_indices][1:-1])
+                    decoded_words = decoded_words[0]
+
+            output_sentences.append(' '.join(decoded_words).replace('<EOS>', ''))
+
+        with open('bleu/predict', 'w', encoding='utf-8') as pr:
+            pr.write('\n'.join(output_sentences))
+        p = subprocess.Popen(['perl', 'bleu/multi-bleu.pl', 'bleu/gold'], stdin=open('bleu/predict'),
+                             stdout=subprocess.PIPE)
+        lines = p.stdout.readlines()
+        return float(lines[0].split()[0][:-1]), output_sentences
 
 
-def evaluateRandomly(embedding, encoder, decoder, n=10):
-    for i in range(n):
-        pair = random.choice(pairs)
+def test(embedding, encoder, decoder, test_pairs, max_length):
+    for pair in test_pairs:
         print('>', pair[0])
         print('=', pair[1])
-        output_words = evaluate(embedding, encoder, decoder, pair[0])
-        output_sentence = ' '.join(output_words)
-        print('<', output_sentence)
+        _, output_sentences = evaluate(embedding, encoder, decoder, [pair], max_length)
+        print('<', output_sentences[0])
         print('')
 
 
 n_epochs = 100
-batch_size = 1
-lr = 0.001
+batch_size = 32
+lr = 0.01
 embed_size = 200
 hidden_size = 256
+
+lang = prepare_vocabulary(char_tokenizer, cut=1)
+print('dec_vocab_size: ', lang.n_words_for_decoder)
+print('vocab_size: ', lang.n_words)
+print('max_word_length: ', max(map(lambda x: len(x), lang.word2index)))
 
 # 共用一套embedding
 embedding = nn.Embedding(lang.n_words, embed_size, padding_idx=0).to(device)
@@ -414,6 +523,19 @@ encoder = EncoderRNN(embed_size, lang.n_words, hidden_size // 2).to(device)
 attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, lang.n_words_for_decoder, lang.n_words, dropout_p=0.1).to(
     device)
 
-trainIters(embedding, encoder, attn_decoder, n_epochs, lr, batch_size, print_every=1)
+data = prepare_data(char_tokenizer)
+train_pairs = []
+dev_pairs = []
+length = []
+for i in range(len(data['data/trainQuestions.txt'])):
+    train_pairs.append((data['data/trainQuestions.txt'][i], data['data/trainAnswers.txt'][i]))
+    length.append(len(data['data/trainAnswers.txt'][i]))
+for i in range(len(data['data/devQuestions.txt'])):
+    dev_pairs.append((data['data/devQuestions.txt'][i], data['data/devAnswers.txt'][i]))
+    length.append(len(data['data/devAnswers.txt'][i]))
+print('max_output_length: ', max(length))
 
-evaluateRandomly(embedding, encoder, attn_decoder)
+# 实际的序列会多一个终止token
+max_length = max(length) + 1
+
+trainIters(embedding, encoder, attn_decoder, train_pairs, max_length, n_epochs, lr, batch_size, print_every=1)
