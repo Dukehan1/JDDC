@@ -547,7 +547,7 @@ print('max_output_length: ', max(length))
 max_length = max(length) + 1
 
 n_epochs = 100
-batch_size = 16
+batch_size = 1
 lr = 0.01
 embed_size = 200
 hidden_size = 256
