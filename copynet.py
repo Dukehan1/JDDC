@@ -66,17 +66,21 @@ def char_tokenizer(sentence):
     return tokens
 
 
-def prepare_vocabulary(tokenizer, cut=3):
+def prepare_vocabulary(tokenizer, files, cut=3):
     # 生成词表，前半部分仅供decoder使用，整体供encoder使用
     lang = Lang('zh-cn')
-    files = ['data/trainAnswers.txt', 'data/trainQuestions.txt']
+    # 仅使用训练集统计
+    files = {
+        'trainAnswers': files['trainAnswers'],
+        'trainQuestions': files['trainQuestions']
+    }
     for f in files:
-        lines = open(f, encoding="utf-8").read().strip().split('\n')
+        lines = files[f]
         for line in lines:
             tokens = tokenizer(line)
             lang.addSentence(tokens)
         # 记录Decoder词表的大小
-        if f == 'data/trainAnswers.txt':
+        if f == 'trainAnswers':
             lang.updateDecoderWords()
 
     # 削减词汇表
@@ -103,20 +107,19 @@ def prepare_vocabulary(tokenizer, cut=3):
     return lang
 
 
-def prepare_data(tokenizer):
+def prepare_data(tokenizer, files):
     # data_to_token_ids
-    files = ['data/trainAnswers.txt', 'data/devAnswers.txt', 'data/trainQuestions.txt', 'data/devQuestions.txt']
     data = {}
     for f in files:
         data[f] = []
         tokenized_sentence = []
-        lines = open(f, encoding="utf-8").read().strip().split('\n')
+        lines = files[f]
         for line in lines:
             tokens = tokenizer(line)
             data[f].append(tokens)
             tokenized_sentence.append(' '.join(tokens))
         # 记录devAnswers，供bleu使用
-        if f == 'data/devAnswers.txt':
+        if f == 'devAnswers':
             with open('bleu/gold', 'w', encoding='utf-8') as gw:
                 gw.write('\n'.join(tokenized_sentence))
 
@@ -506,36 +509,53 @@ def test(embedding, encoder, decoder, test_pairs, max_length):
         print('')
 
 
-n_epochs = 100
-batch_size = 32
-lr = 0.01
-embed_size = 200
-hidden_size = 256
+# 从10份中取一份作dev
+dev_id = 0
+files = {
+    'trainAnswers': [],
+    'devAnswers': [],
+    'trainQuestions': [],
+    'devQuestions': []
+}
+train_idx = list(filter(lambda x: x != dev_id, range(10)))
+for i in train_idx:
+    files['trainAnswers'].extend(open('data/answers-' + str(i) + '.txt', encoding="utf-8").read().strip().split('\n'))
+    files['trainQuestions'].extend(open('data/questions-' + str(i) + '.txt', encoding="utf-8").read().strip().split('\n'))
+files['devAnswers'].extend(open('data/answers-' + str(dev_id) + '.txt', encoding="utf-8").read().strip().split('\n'))
+files['devQuestions'].extend(open('data/questions-' + str(dev_id) + '.txt', encoding="utf-8").read().strip().split('\n'))
 
-lang = prepare_vocabulary(char_tokenizer, cut=1)
+# 生成词表
+lang = prepare_vocabulary(char_tokenizer, files, cut=1)
 print('dec_vocab_size: ', lang.n_words_for_decoder)
 print('vocab_size: ', lang.n_words)
 print('max_word_length: ', max(map(lambda x: len(x), lang.word2index)))
+
+# 生成数据
+data = prepare_data(char_tokenizer, files)
+train_pairs = []
+dev_pairs = []
+length = []
+for i in range(len(data['trainQuestions'])):
+    train_pairs.append((data['trainQuestions'][i], data['trainAnswers'][i]))
+    length.append(len(data['trainAnswers'][i]))
+for i in range(len(data['devQuestions'])):
+    dev_pairs.append((data['devQuestions'][i], data['devAnswers'][i]))
+    length.append(len(data['devAnswers'][i]))
+print('max_output_length: ', max(length))
+
+# 实际的序列会多一个终止token
+max_length = max(length) + 1
+
+n_epochs = 100
+batch_size = 16
+lr = 0.01
+embed_size = 200
+hidden_size = 256
 
 # 共用一套embedding
 embedding = nn.Embedding(lang.n_words, embed_size, padding_idx=0).to(device)
 encoder = EncoderRNN(embed_size, lang.n_words, hidden_size // 2).to(device)
 attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, lang.n_words_for_decoder, lang.n_words, dropout_p=0.1).to(
     device)
-
-data = prepare_data(char_tokenizer)
-train_pairs = []
-dev_pairs = []
-length = []
-for i in range(len(data['data/trainQuestions.txt'])):
-    train_pairs.append((data['data/trainQuestions.txt'][i], data['data/trainAnswers.txt'][i]))
-    length.append(len(data['data/trainAnswers.txt'][i]))
-for i in range(len(data['data/devQuestions.txt'])):
-    dev_pairs.append((data['data/devQuestions.txt'][i], data['data/devAnswers.txt'][i]))
-    length.append(len(data['data/devAnswers.txt'][i]))
-print('max_output_length: ', max(length))
-
-# 实际的序列会多一个终止token
-max_length = max(length) + 1
 
 trainIters(embedding, encoder, attn_decoder, train_pairs, max_length, n_epochs, lr, batch_size, print_every=1)

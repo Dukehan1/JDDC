@@ -2,8 +2,10 @@
 
 import codecs
 import logging
-import random
 import os
+
+from sklearn.model_selection import KFold
+
 
 def data_processing():
     with codecs.open("data/questions.txt", mode="w", encoding="utf-8") as wfquestion:
@@ -96,68 +98,22 @@ def data_processing():
                     wf_question.close()
                     wf_answer.close()
    
-def cutDataToTrainDevBy91():
-    randomList = []
-    with codecs.open("data/devQuestions.txt", mode="w", encoding="utf-8") as wf_devQuestion:
-        with codecs.open("data/devAnswers.txt", mode="w", encoding="utf-8") as wf_devAnswer:
-            with codecs.open("data/trainQuestions.txt", mode="w", encoding="utf-8") as wf_trainQuestion:
-                with codecs.open("data/trainAnswers.txt", mode="w", encoding="utf-8") as wf_trainAnswer:
-                    try:
-                        wf_devQuestion.truncate()
-                        wf_devAnswer.truncate()
-                        wf_trainQuestion.truncate()
-                        wf_trainAnswer.truncate()
-                    except Exception as e:
-                        logging.info("data_processing:clear data_processing.txt error:" + str(e))
-                    finally:
-                        wf_devQuestion.close()
-                        wf_devAnswer.close()
-                        wf_trainQuestion.truncate()
-                        wf_trainAnswer.truncate()    
-    
-    with codecs.open("data/questions.txt", mode = 'r', encoding = "utf-8") as rf_question:
-        with codecs.open("data/answers.txt", mode = 'r', encoding = "utf-8") as rf_answer:
-            try:
-                questionLines = rf_question.readlines()
-                answerLines = rf_answer.readlines()
-                #trainset的十分之一的数据集作为devset
-                randomList = random.sample(range(len(questionLines)-1), int(len(questionLines)/10))
-                with codecs.open("data/devQuestions.txt", mode = 'a', encoding = "utf-8") as wf_devQuestion:
-                    with codecs.open("data/devAnswers.txt", mode = 'a', encoding = "utf-8") as wf_devAnswer:
-                        try:
-                            for i in randomList:
-                                wf_devQuestion.write(questionLines[i])
-                                wf_devAnswer.write(answerLines[i])
-                        except Exception as e:
-                            logging.error("cutDataToTrainDevBy91: failure" + str(e))
-                        finally:
-                            wf_devQuestion.close()
-                            wf_devAnswer.close()
-                
-            except Exception as e:
-                logging.error("cutDataToTrainDevBy91: failure" + str(e))
-            finally:
-                rf_question.close()
-                rf_answer.close()
-                
-    with codecs.open("data/questions.txt", mode = 'r', encoding="utf-8") as rf_question:
-        with codecs.open("data/answers.txt", mode='r',encoding="utf-8") as rf_answer:
-            questions = rf_question.readlines()
-            answers = rf_answer.readlines()
-            with codecs.open("data/trainQuestions.txt",mode='a',encoding="utf-8") as wf_question:
-                with codecs.open("data/trainAnswers.txt",mode='a',encoding="utf-8") as wf_answer:
-                    for i in range(len(questions)):
-                        if i not in randomList:
-                            wf_question.write(questions[i])
-                    for i in range(len(answers)):
-                        if i not in randomList:
-                            wf_answer.write(answers[i])
-                            
-                    rf_question.close()
-                    rf_answer.close()
-                    wf_question.close()
-                    wf_answer.close()
-    
+def cutData():
+
+    X = open('data/questions.txt', encoding="utf-8").read().strip().split('\n')
+    y = open('data/answers.txt', encoding="utf-8").read().strip().split('\n')
+
+    skf = KFold(n_splits=10, random_state=2333, shuffle=True)
+    i = 0
+    for train_index, dev_index in skf.split(X, y):
+        print(dev_index)
+        p1 = open('data/questions-' + str(i) + '.txt', 'w', encoding='utf-8')
+        p1.write('\n'.join([X[i] for i in dev_index]))
+        p1.close()
+        p2 = open('data/answers-' + str(i) + '.txt', 'w', encoding='utf-8')
+        p2.write('\n'.join([y[i] for i in dev_index]))
+        p2.close()
+        i += 1
                             
     # os.remove("questions.txt")
     # os.remove("answers.txt")
@@ -165,5 +121,5 @@ def cutDataToTrainDevBy91():
                 
 if __name__ == "__main__": 
     data_processing()
-    cutDataToTrainDevBy91()
+    cutData()
  
