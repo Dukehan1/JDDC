@@ -217,17 +217,17 @@ class CopynetDecoderRNN(nn.Module):
         score = F.softmax(torch.cat((generate_score, copy_score), 1), dim=1)
         generate_score, copy_score = torch.split(score, (self.dec_vocab_size, l), 1)
 
-        encoder_input_mask = torch.zeros(b, l, self.vocab_size, device=device).scatter_(2, encoder_input_ids.unsqueeze(2),
-                                                                         1)  # (b, l, vocab_size)
-        prob_c_one_hot = copy_score.unsqueeze(2) * encoder_input_mask  # (b, l, vocab_size)
+        prob_g = torch.cat((generate_score, torch.zeros(b, self.vocab_size - self.dec_vocab_size, device=device)), 1)  # (b, vocab_size)
+        
+        # scatter_add_ 是0.5中的函数，0.4中还未发布
+        # prob_c = torch.zeros(b, self.vocab_size, device=device).scatter_add_(1, encoder_input_ids, copy_score)  # (b, vocab_size)
+        prob_c = torch.zeros(b, self.vocab_size, device=device)
+        for b_idx in range(b):
+            for l_idx in range(l):
+                prob_c[b_idx, encoder_input_ids[b_idx, l_idx]] += copy_score[b_idx, l_idx]
 
-        gen_output_mask = torch.zeros(b, self.dec_vocab_size, self.vocab_size, device=device). \
-            scatter_(2, torch.tensor(range(self.dec_vocab_size), dtype=torch.long, device=device).view(1, -1, 1).expand(b, -1, 1),
-                     1)  # (b, dec_vocab_size, vocab_size)
-        prob_g_one_hot = generate_score.unsqueeze(2) * gen_output_mask  # (b, dec_vocab_size, vocab_size)
 
-        prob_total = torch.cat((prob_g_one_hot, prob_c_one_hot), 1)  # (b, dec_vocab_size + l, vocab_size)
-        output = torch.sum(prob_total, dim=1)  # (b, vocab_size)
+        output = prob_g + prob_c  # (b, vocab_size)
         output[output == 0] = float('-inf')  # 将概率为0的项替换成-inf
         output = torch.log(output)  # (b, vocab_size)
         output[torch.isnan(output)] = float('-inf')  # 将nan替换成-inf
@@ -524,14 +524,22 @@ for i in train_idx:
 files['devAnswers'].extend(open('data/answers-' + str(dev_id) + '.txt', encoding="utf-8").read().strip().split('\n'))
 files['devQuestions'].extend(open('data/questions-' + str(dev_id) + '.txt', encoding="utf-8").read().strip().split('\n'))
 
+# for debug
+'''
+files['trainAnswers'] = files['trainAnswers'][:5]
+files['trainQuestions'] = files['trainQuestions'][:5]
+files['devAnswers'] = files['trainAnswers']
+files['devQuestions'] = files['trainQuestions']
+'''
+
 # 生成词表
-lang = prepare_vocabulary(char_tokenizer, files, cut=1)
+lang = prepare_vocabulary(word_tokenizer, files, cut=3)
 print('dec_vocab_size: ', lang.n_words_for_decoder)
 print('vocab_size: ', lang.n_words)
 print('max_word_length: ', max(map(lambda x: len(x), lang.word2index)))
 
 # 生成数据
-data = prepare_data(char_tokenizer, files)
+data = prepare_data(word_tokenizer, files)
 train_pairs = []
 dev_pairs = []
 length = []
@@ -547,8 +555,8 @@ print('max_output_length: ', max(length))
 max_length = max(length) + 1
 
 n_epochs = 100
-batch_size = 1
-lr = 0.01
+batch_size = 32
+lr = 0.001
 embed_size = 200
 hidden_size = 256
 
