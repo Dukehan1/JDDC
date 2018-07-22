@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from torch.nn.utils import clip_grad_norm_
 import subprocess
+import os
+import pickle
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,12 +50,22 @@ class Lang:
 
 # Regular expressions used to tokenize.
 _DIGIT_RE = re.compile("\d+")
+special_words = [
+    '<s>', '#E-s', '[USERID_0]', '[ORDERID_0]', '[数字x]', '[金额x]', '[日期x]', '[时间x]', 
+    '[电话x]', '[地址x]', '[站点x]', '[姓名x]', '[邮箱x]', '[身份证号x]', '[链接x]', '[组织机构x]'
+]
 
 
 def word_tokenizer(sentence):
     # word level
     sentence = re.sub(_DIGIT_RE, "0", sentence)
-    tokens = list(jieba.cut(sentence))
+    chunks = re.split(r'(' + '|'.join(special_words).replace('[', '\[').replace(']', '\]') + ')', sentence)
+    tokens = []
+    for c in chunks:
+        if c not in special_words:
+            tokens.extend(list(jieba.cut(c)))
+        else:
+            tokens.append(c)
     tokens = [word for word in tokens if word]
     return tokens
 
@@ -220,11 +232,13 @@ class CopynetDecoderRNN(nn.Module):
         prob_g = torch.cat((generate_score, torch.zeros(b, self.vocab_size - self.dec_vocab_size, device=device)), 1)  # (b, vocab_size)
         
         # scatter_add_ 是0.5中的函数，0.4中还未发布
-        # prob_c = torch.zeros(b, self.vocab_size, device=device).scatter_add_(1, encoder_input_ids, copy_score)  # (b, vocab_size)
+        prob_c = torch.zeros(b, self.vocab_size, device=device).scatter_add_(1, encoder_input_ids, copy_score)  # (b, vocab_size)
+        '''
         prob_c = torch.zeros(b, self.vocab_size, device=device)
         for b_idx in range(b):
             for l_idx in range(l):
                 prob_c[b_idx, encoder_input_ids[b_idx, l_idx]] += copy_score[b_idx, l_idx]
+        '''
 
 
         output = prob_g + prob_c  # (b, vocab_size)
@@ -271,107 +285,6 @@ def get_minibatches(data, minibatch_size, shuffle=True):
 
 def minibatch(data, minibatch_idx):
     return data[minibatch_idx] if type(data) is np.ndarray else [data[i] for i in minibatch_idx]
-
-
-teacher_forcing_ratio = 1.0
-
-
-def train(input, input_lens, target, target_lens, embedding, encoder, decoder, optimizer, criterion):
-    # Training mode (enable dropout)
-    encoder.train()
-    decoder.train()
-    optimizer.zero_grad()
-    loss = 0
-
-    b = len(input)
-
-    encoder_input = embedding(input)  # (b, l, embed)
-    encoder_outputs, decoder_hidden = encoder.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (b, 1, hidden)
-
-    decoder_input_id = torch.zeros(b, 1, dtype=torch.long, device=device).fill_(SOS_token)  # (b, 1)
-    decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
-    decoder_attention = torch.zeros(b, 1, decoder.hidden_size, device=device)  # (b, 1, hidden)
-
-    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
-
-    if use_teacher_forcing:
-        # Teacher forcing: Feed the target as the next input
-        for di in range(len(target[0])):
-            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, decoder_input,
-                                                                        encoder_outputs, input, decoder_hidden,
-                                                                        decoder_attention)
-            loss += criterion(decoder_output, target[:, di])
-
-            decoder_input_id = target[:, di].view(-1, 1)  # (b, 1)
-            decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
-
-    loss.backward()
-    # print(map(lambda x: x.grad, embedding.parameters()))
-    # print(map(lambda x: x.grad, encoder.parameters()))
-    # print(map(lambda x: x.grad, decoder.parameters()))
-    clip_grad_norm_(embedding.parameters(), 5)
-    clip_grad_norm_(encoder.parameters(), 5)
-    clip_grad_norm_(decoder.parameters(), 5)
-
-    optimizer.step()
-
-    return loss.item() / len(target_lens)
-
-
-def trainIters(embedding, encoder, decoder, train_pairs, max_length, n_iters, learning_rate, batch_size, print_every=1000, plot_every=100):
-    plot_losses = []
-    print_loss_total = 0  # Reset every print_every
-    plot_loss_total = 0  # Reset every plot_every
-    train_data = []
-    best_bleu_score = 0.0
-    optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": encoder.parameters()},
-                            {"params": decoder.parameters()}], lr=learning_rate, amsgrad=True)
-    for pair in train_pairs:
-        train_data.append(indexesFromPair(lang, pair))
-    criterion = nn.NLLLoss()
-
-    for iter in range(1, n_iters + 1):
-        print("======================iter%s============================" % iter)
-        for i, training_pairs in enumerate(get_minibatches(train_data, batch_size)):
-            print("batch: ", i)
-            # 排序并padding
-            training_pairs = sorted(training_pairs, key=lambda x: len(x[0]), reverse=True)
-            enc_lens = list(map(lambda x: len(x[0]), training_pairs))
-            dec_lens = list(map(lambda x: len(x[1]), training_pairs))
-            enc_max_len = max(enc_lens)
-            dec_max_len = max(dec_lens)
-            enc = []
-            dec = []
-            for t in training_pairs:
-                enc.append(t[0] + (enc_max_len - len(t[0])) * [0])
-                dec.append(t[1] + (dec_max_len - len(t[1])) * [0])
-            enc = torch.tensor(enc, dtype=torch.long, device=device)
-            dec = torch.tensor(dec, dtype=torch.long, device=device)
-
-            loss = train(enc, enc_lens, dec, dec_lens, embedding, encoder, decoder, optimizer, criterion)
-
-            print_loss_total += loss
-            plot_loss_total += loss
-
-        if iter % print_every == 0:
-            print_loss_avg = print_loss_total / print_every
-            print_loss_total = 0
-            print('(%d %d%%) %.4f' % (iter, iter / n_iters * 100, print_loss_avg))
-
-        if iter % plot_every == 0:
-            plot_loss_avg = plot_loss_total / plot_every
-            plot_losses.append(plot_loss_avg)
-            plot_loss_total = 0
-
-        bleu_score, _ = evaluate(embedding, encoder, decoder, dev_pairs, max_length)
-        bleu_score = bleu_score if bleu_score is not None else 0
-        print('bleu_socre: {0}'.format(bleu_score))
-        if bleu_score >= best_bleu_score:
-            best_bleu_score = bleu_score
-            torch.save(encoder.state_dict(), 'model/encoder')
-            torch.save(decoder.state_dict(), 'model/decoder')
-            torch.save(embedding.state_dict(), 'model/embedding')
-            print('new model saved.')
 
 
 class Node(object):
@@ -449,64 +362,196 @@ def beam_search(encoder_outputs, decoder_hidden, decoder_attention, decoder, emb
     return hypotheses[:num_hypotheses]
 
 
-def evaluate(embedding, encoder, decoder, dev_pairs, max_length, bms=False):
+teacher_forcing_ratio = 1.0
+
+
+def train(input, input_lens, target, target_lens, embedding, encoder, decoder, optimizer, criterion):
+    # Training mode (enable dropout)
+    encoder.train()
+    decoder.train()
+    optimizer.zero_grad()
+    loss = 0
+
+    b = len(input)
+
+    encoder_input = embedding(input)  # (b, l, embed)
+    encoder_outputs, decoder_hidden = encoder.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (b, 1, hidden)
+
+    decoder_input_id = torch.zeros(b, 1, dtype=torch.long, device=device).fill_(SOS_token)  # (b, 1)
+    decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
+    decoder_attention = torch.zeros(b, 1, decoder.hidden_size, device=device)  # (b, 1, hidden)
+
+    use_teacher_forcing = True if random.random() < teacher_forcing_ratio else False
+
+    if use_teacher_forcing:
+        # Teacher forcing: Feed the target as the next input
+        for di in range(len(target[0])):
+            decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, decoder_input,
+                                                                        encoder_outputs, input, decoder_hidden,
+                                                                        decoder_attention)
+            loss += criterion(decoder_output, target[:, di])
+
+            decoder_input_id = target[:, di].view(-1, 1)  # (b, 1)
+            decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
+
+    loss.backward()
+    # print(map(lambda x: x.grad, embedding.parameters()))
+    # print(map(lambda x: x.grad, encoder.parameters()))
+    # print(map(lambda x: x.grad, decoder.parameters()))
+    clip_grad_norm_(embedding.parameters(), 5)
+    clip_grad_norm_(encoder.parameters(), 5)
+    clip_grad_norm_(decoder.parameters(), 5)
+
+    optimizer.step()
+
+    return loss.item() / len(target_lens)
+
+
+def inference(input, input_lens, embedding, encoder, decoder, max_length, bms=False):
     with torch.no_grad():
-        output_sentences = []
         # Inference mode (disable dropout)
         encoder.eval()
         decoder.eval()
 
-        for pair in dev_pairs:
-            input = torch.tensor([indexesFromSentence(lang, pair[0])], dtype=torch.long, device=device)
+        b = len(input)
 
-            encoder_input = embedding(input)  # (1, l, embed)
-            encoder_outputs, decoder_hidden = encoder(encoder_input)  # (1, l, hidden), (1, 1, hidden)
+        encoder_input = embedding(input)  # (b, l, embed)
+        encoder_outputs, decoder_hidden = encoder.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (b, 1, hidden)
 
-            decoder_input_id = torch.zeros(1, 1, dtype=torch.long, device=device).fill_(SOS_token)  # (1, 1)
-            decoder_input = embedding(decoder_input_id)  # (1, 1, embed)
-            decoder_attention = torch.zeros(1, 1, decoder.hidden_size, device=device)  # (1, 1, hidden)
+        decoder_input_id = torch.zeros(b, 1, dtype=torch.long, device=device).fill_(SOS_token)  # (b, 1)
+        decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
+        decoder_attention = torch.zeros(b, 1, decoder.hidden_size, device=device)  # (b, 1, hidden)
 
-            decoded_words = []
-
-            if not bms:
-                for di in range(max_length):
-                    decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, decoder_input,
+        decoded_idxs = np.empty((b, 0), dtype=int)
+        if not bms:
+            for di in range(max_length):
+                decoder_output, decoder_hidden, decoder_attention = decoder(decoder_input_id, decoder_input,
                                                                                 encoder_outputs, input, decoder_hidden,
                                                                                 decoder_attention)
-                    topv, topi = decoder_output.data.topk(1)
-                    if topi.item() == EOS_token:
-                        decoded_words.append('<EOS>')
-                        break
-                    else:
-                        decoded_words.append(lang.index2word[topi.item()])
+                topi = torch.argmax(decoder_output, dim=1, keepdim=True)  # (b, 1)
+                decoded_idxs = np.concatenate((decoded_idxs, topi.cpu().numpy()), axis=1)
+                    
+                decoder_input_id = topi.detach()  # (b, 1)
+                decoder_input = embedding(decoder_input_id)  # (b, 1, embed)            
 
-                    decoder_input_id = topi.squeeze().detach().view(1, 1)  # (1, 1)
-                    decoder_input = embedding(decoder_input_id)  # (1, 1, embed).
-            else:
-                hypotheses = beam_search(encoder_outputs, decoder_hidden, decoder_attention, decoder, embedding, input,
-                                         max_length)
-                for hypothesis in hypotheses:
-                    decoder_indices = hypothesis.to_sequence_of_values()
-                    decoded_words.append([lang.index2word[i] for i in decoder_indices][1:-1])
-                    decoded_words = decoded_words[0]
+        decoded_words = []
+        for s in decoded_idxs:
+            sentence = []
+            for w in s:
+                if w != EOS_token:
+                    sentence.append(lang.index2word[w])
+                else:
+                    break
+            decoded_words.append(sentence)
 
-            output_sentences.append(' '.join(decoded_words).replace('<EOS>', ''))
-
-        with open('bleu/predict', 'w', encoding='utf-8') as pr:
-            pr.write('\n'.join(output_sentences))
-        p = subprocess.Popen(['perl', 'bleu/multi-bleu.pl', 'bleu/gold'], stdin=open('bleu/predict'),
-                             stdout=subprocess.PIPE)
-        lines = p.stdout.readlines()
-        return float(lines[0].split()[0][:-1]), output_sentences
+        return decoded_words
 
 
-def test(embedding, encoder, decoder, test_pairs, max_length):
-    for pair in test_pairs:
-        print('>', pair[0])
-        print('=', pair[1])
-        _, output_sentences = evaluate(embedding, encoder, decoder, [pair], max_length)
-        print('<', output_sentences[0])
-        print('')
+def trainIters(embedding, encoder, decoder, train_pairs, dev_pairs, max_length, n_iters, learning_rate, batch_size, infer_batch_size, print_every=1000, plot_every=100):
+    plot_losses = []
+    print_loss_total = 0  # Reset every print_every
+    plot_loss_total = 0  # Reset every plot_every
+    best_bleu_score = 0.0
+    optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": encoder.parameters()},
+                            {"params": decoder.parameters()}], lr=learning_rate, amsgrad=True)
+    criterion = nn.NLLLoss()
+
+    for iter in range(1, n_iters + 1):
+        print("======================iter%s============================" % iter)
+        for i, training_batch in enumerate(get_minibatches(train_pairs, batch_size)):
+            print("batch: ", i)
+            # 排序并padding
+            training_batch = sorted(training_batch, key=lambda x: len(x[0]), reverse=True)
+            training_batch = list(map(lambda x: indexesFromPair(lang, x), training_batch))
+            enc_lens = list(map(lambda x: len(x[0]), training_batch))
+            dec_lens = list(map(lambda x: len(x[1]), training_batch))
+            print("enc_lens: ", enc_lens)
+            print("dec_lens: ", dec_lens)
+            enc_max_len = max(enc_lens)
+            dec_max_len = max(dec_lens)
+            enc = []
+            dec = []
+            for t in training_batch:
+                enc.append(t[0] + (enc_max_len - len(t[0])) * [0])
+                dec.append(t[1] + (dec_max_len - len(t[1])) * [0])
+            enc = torch.tensor(enc, dtype=torch.long, device=device)
+            dec = torch.tensor(dec, dtype=torch.long, device=device)
+
+            loss = train(enc, enc_lens, dec, dec_lens, embedding, encoder, decoder, optimizer, criterion)
+
+            print_loss_total += loss
+            plot_loss_total += loss
+
+            if i / 4000 == 0 and i != 0:
+                print("============evaluate_start==================")
+                bleu_score = evaluate(embedding, encoder, decoder, dev_pairs, max_length, infer_batch_size)
+                print('bleu_socre: {0}'.format(bleu_score))
+                if bleu_score >= best_bleu_score:
+                    best_bleu_score = bleu_score
+                    torch.save(encoder.state_dict(), 'model/encoder')
+                    torch.save(decoder.state_dict(), 'model/decoder')
+                    torch.save(embedding.state_dict(), 'model/embedding')
+                    print('new model saved.')
+                print("==============evaluate_end==================")
+
+        if iter % print_every == 0:
+            print_loss_avg = print_loss_total / print_every
+            print_loss_total = 0
+            print('(%d %d%%) %.4f' % (iter, iter / n_iters * 100, print_loss_avg))
+
+        if iter % plot_every == 0:
+            plot_loss_avg = plot_loss_total / plot_every
+            plot_losses.append(plot_loss_avg)
+            plot_loss_total = 0
+
+        print("============evaluate_start==================")
+        bleu_score = evaluate(embedding, encoder, decoder, dev_pairs, max_length, infer_batch_size)
+        print('bleu_socre: {0}'.format(bleu_score))
+        if bleu_score >= best_bleu_score:
+            best_bleu_score = bleu_score
+            torch.save(encoder.state_dict(), 'model/encoder')
+            torch.save(decoder.state_dict(), 'model/decoder')
+            torch.save(embedding.state_dict(), 'model/embedding')
+            print('new model saved.')
+        print("==============evaluate_end==================")
+
+
+def evaluate(embedding, encoder, decoder, dev_pairs, max_length, infer_batch_size):
+    target_words = []
+    decoded_words = []
+    for i in range(0, len(dev_pairs), infer_batch_size):
+        print("batch: ", int(i / infer_batch_size))
+        dev_batch = dev_pairs[i:i + infer_batch_size]
+        # 排序并padding
+        dev_batch = sorted(dev_batch, key=lambda x: len(x[0]), reverse=True)
+        target_words.extend(map(lambda x: x[1], dev_batch))
+        dev_batch = list(map(lambda x: indexesFromPair(lang, x), dev_batch))
+        enc_lens = list(map(lambda x: len(x[0]), dev_batch))
+        print("enc_lens: ", enc_lens)
+        enc_max_len = max(enc_lens)
+        enc = []
+        for t in dev_batch:
+            enc.append(t[0] + (enc_max_len - len(t[0])) * [0])
+        enc = torch.tensor(enc, dtype=torch.long, device=device)
+
+        decoded_words.extend(inference(enc, enc_lens, embedding, encoder, decoder, max_length))
+
+    target_sentences = list(map(lambda x: ' '.join(x), target_words))
+    output_sentences = list(map(lambda x: ' '.join(x), decoded_words))
+
+    with open('bleu/gold', 'w', encoding='utf-8') as gw:
+        gw.write('\n'.join(target_sentences))
+        gw.close()
+    with open('bleu/predict', 'w', encoding='utf-8') as pr:
+        pr.write('\n'.join(output_sentences))
+        pr.close()
+    p = subprocess.Popen(['perl', 'multi-bleu.pl', 'bleu/gold'], stdin=open('bleu/predict'),
+                         stdout=subprocess.PIPE)
+    lines = p.stdout.readlines()
+    
+    bleu_score = float(lines[0].split()[0][:-1])
+    bleu_score = bleu_score if bleu_score is not None else 0
+    return bleu_score
 
 
 # 从10份中取一份作dev
@@ -533,29 +578,60 @@ files['devQuestions'] = files['trainQuestions']
 '''
 
 # 生成词表
-lang = prepare_vocabulary(word_tokenizer, files, cut=3)
+if os.path.exists('model/lang'):
+    t = open('model/lang', 'rb')
+    lang = pickle.load(t)
+    t.close()
+else:
+    lang = prepare_vocabulary(word_tokenizer, files, cut=3)
+    t = open('model/lang', 'wb')
+    pickle.dump(lang, t)
+    t.close()
 print('dec_vocab_size: ', lang.n_words_for_decoder)
 print('vocab_size: ', lang.n_words)
 print('max_word_length: ', max(map(lambda x: len(x), lang.word2index)))
 
-# 生成数据
-data = prepare_data(word_tokenizer, files)
+# 生成数据（截断过长数据）
+ENC_MAX_LEN = 700
+DEC_MAX_LEN = 200
+if os.path.exists('model/data'):
+    t = open('model/data', 'rb')
+    data = pickle.load(t)
+    t.close()
+else:
+    data = prepare_data(word_tokenizer, files)
+    t = open('model/data', 'wb')
+    pickle.dump(data, t)
+    t.close()
 train_pairs = []
 dev_pairs = []
-length = []
 for i in range(len(data['trainQuestions'])):
+    if len(data['trainQuestions'][i]) > ENC_MAX_LEN:
+        data['trainQuestions'][i] = data['trainQuestions'][i][-ENC_MAX_LEN:]
+        # print(data['trainQuestions'][i])
+        # print(len(data['trainQuestions'][i]))
+    if len(data['trainAnswers'][i]) > DEC_MAX_LEN:
+        data['trainAnswers'][i] = data['trainAnswers'][i][:DEC_MAX_LEN]
+        # print(data['trainAnswers'][i])
+        # print(len(data['trainAnswers'][i]))
     train_pairs.append((data['trainQuestions'][i], data['trainAnswers'][i]))
-    length.append(len(data['trainAnswers'][i]))
 for i in range(len(data['devQuestions'])):
+    if len(data['devQuestions'][i]) > ENC_MAX_LEN:
+        data['devQuestions'][i] = data['devQuestions'][i][-ENC_MAX_LEN:]
+        # print(data['devQuestions'][i])
+        # print(len(data['devQuestions'][i]))
+    if len(data['devAnswers'][i]) > DEC_MAX_LEN:
+        data['devAnswers'][i] = data['devAnswers'][i][:DEC_MAX_LEN]
+        # print(data['devAnswers'][i])
+        # print(len(data['devAnswers'][i]))
     dev_pairs.append((data['devQuestions'][i], data['devAnswers'][i]))
-    length.append(len(data['devAnswers'][i]))
-print('max_output_length: ', max(length))
 
 # 实际的序列会多一个终止token
-max_length = max(length) + 1
+max_length = DEC_MAX_LEN + 1
 
-n_epochs = 100
-batch_size = 32
+n_epochs = 2
+batch_size = 16
+infer_batch_size = 1024
 lr = 0.001
 embed_size = 200
 hidden_size = 256
@@ -566,4 +642,4 @@ encoder = EncoderRNN(embed_size, lang.n_words, hidden_size // 2).to(device)
 attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, lang.n_words_for_decoder, lang.n_words, dropout_p=0.1).to(
     device)
 
-trainIters(embedding, encoder, attn_decoder, train_pairs, max_length, n_epochs, lr, batch_size, print_every=1)
+trainIters(embedding, encoder, attn_decoder, train_pairs, dev_pairs, max_length, n_epochs, lr, batch_size, infer_batch_size, print_every=1)
