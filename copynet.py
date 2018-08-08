@@ -184,43 +184,52 @@ def indexesFromPair(lang, pair):
 
 
 class EncoderRNN(nn.Module):
-    def __init__(self, embed_size, vocab_size, hidden_size):
+    def __init__(self, embed_size, vocab_size, hidden_size, num_layers=2, dropout_p=0.5):
         super(EncoderRNN, self).__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout_p = dropout_p
 
-        self.gru = nn.GRU(embed_size, hidden_size, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers=self.num_layers, batch_first=True, bidirectional=True,
+                           dropout=self.dropout_p)
 
     def forward(self, input):
         '''
         :param input: (b, l, embed)
         :return:
         '''
-        output, h_n = self.gru(input)  # (b, l, hidden * 2), (b, 2, hidden)
-        h_n = h_n.view(-1, 1, self.hidden_size * 2)  # (b, 1, hidden * 2)
+        output, (h_n, c_n) = self.lstm(input)  # (b, l, hidden * 2), (num_layers * 2, b, hidden)
+        h_n = h_n.transpose(0, 1)
+        h_n = h_n.reshape(-1, self.num_layers, self.hidden_size * 2)
+        h_n = h_n.transpose(0, 1)  # (num_layers, b, hidden * 2)
+        c_n = c_n.transpose(0, 1)
+        c_n = c_n.reshape(-1, self.num_layers, self.hidden_size * 2)
+        c_n = c_n.transpose(0, 1)  # (num_layers, b, hidden * 2)
 
-        return output, h_n
+        return output, (h_n, c_n)
 
     def pack_unpack(self, input, input_lens):
         packed_input = pack_padded_sequence(input, input_lens, batch_first=True)
-        packed_output, h_n = self.forward(packed_input)
+        packed_output, (h_n, c_n) = self.forward(packed_input)
         output, _ = pad_packed_sequence(packed_output, batch_first=True)
-        return output, h_n
+        return output, (h_n, c_n)
 
 
 class CopynetDecoderRNN(nn.Module):
-    def __init__(self, embed_size, hidden_size, dec_vocab_size, vocab_size, dropout_p=0.1):
+    def __init__(self, embed_size, hidden_size, dec_vocab_size, vocab_size, num_layers=2, dropout_p=0.5):
         super(CopynetDecoderRNN, self).__init__()
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
         self.dropout_p = dropout_p
         self.vocab_size = vocab_size
         self.dec_vocab_size = dec_vocab_size
 
-        self.dropout = nn.Dropout(self.dropout_p)
-        self.gru = nn.GRU(hidden_size * 2 + embed_size, hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(hidden_size * 2 + embed_size, hidden_size, num_layers=self.num_layers, batch_first=True,
+                           dropout=self.dropout_p)
         self.attn = nn.Linear(hidden_size, hidden_size)
         self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
-        self.gen_out = nn.Linear(hidden_size, dec_vocab_size)
+        self.gen_out = nn.Linear(hidden_size, vocab_size)
         self.copy_out = nn.Linear(self.hidden_size, self.hidden_size)
 
     def forward(self, input_id, input, encoder_outputs, encoder_input_ids, hidden, attention):
@@ -229,7 +238,7 @@ class CopynetDecoderRNN(nn.Module):
         :param input: (b, 1, embed)
         :param encoder_outputs: (b, l, hidden)
         :param encoder_input_ids: (b, l)
-        :param hidden: (b, 1, hidden)
+        :param hidden: (num_layers, b, hidden)
         :param attention: (b, 1, hidden)
         :return:
         '''
@@ -241,44 +250,37 @@ class CopynetDecoderRNN(nn.Module):
         rou[torch.isnan(rou)] = 0  # (b, l)
         selective_read = torch.bmm(rou.unsqueeze(1), encoder_outputs)  # (b, 1, hidden_size)
 
-        input = self.dropout(input)  # (b, 1, embed)
+        encoder_input_ids_mask = encoder_input_ids == 0
 
-        input = torch.cat((input, attention, selective_read), 2)  # (b, 1, hidden + embed)
-        _, cur_hidden = self.gru(input, hidden.transpose(0, 1))
-        cur_hidden = cur_hidden.transpose(0, 1)  # (b, 1, hidden)
+        input = torch.cat((input, attention, selective_read), 2)  # (b, 1, hidden * 2 + embed)
+        o, cur_hidden = self.lstm(input, hidden)  # (b, 1, hidden), (num_layers, b, hidden)
 
-        attn_weights = F.softmax(torch.bmm(self.attn(cur_hidden),
-                                           encoder_outputs.transpose(1, 2)), dim=2)  # (b, 1, l)
+        attn_weights = F.softmax(torch.bmm(self.attn(o),
+                                           encoder_outputs.transpose(1, 2)).masked_fill_(
+            encoder_input_ids_mask.unsqueeze(1), -float('inf')), dim=2)  # (b, 1, l)
         attn_applied = torch.bmm(attn_weights, encoder_outputs)  # (b, 1, hidden)
         cur_attention = torch.tanh(
-            self.attn_combine(torch.cat((attn_applied, cur_hidden), 2)))  # (b, 1, hidden_size)
+            self.attn_combine(torch.cat((attn_applied, o), 2)))  # (b, 1, hidden)
 
-        generate_score = self.gen_out(cur_attention).squeeze(1)  # (b, dec_vocab_size)
+        generate_score = self.gen_out(cur_attention).squeeze(1)  # (b, vocab_size)
 
         # CopyNet
         copy_weights = torch.sigmoid(self.copy_out(encoder_outputs))  # (b, l, hidden)
-        copy_score = torch.bmm(copy_weights, cur_attention.transpose(1, 2)).squeeze(2)  # (b, l)
+        copy_score = torch.bmm(copy_weights, cur_attention.transpose(1, 2)).squeeze(2).masked_fill_(
+            encoder_input_ids_mask, -float('inf'))  # (b, l)
 
         score = F.softmax(torch.cat((generate_score, copy_score), 1), dim=1)
-        generate_score, copy_score = torch.split(score, (self.dec_vocab_size, l), 1)
+        generate_score, copy_score = torch.split(score, (self.vocab_size, l), 1)
 
-        prob_g = torch.cat((generate_score, torch.zeros(b, self.vocab_size - self.dec_vocab_size, device=device_cuda)), 1)  # (b, vocab_size)
+        prob_g = generate_score  # (b, vocab_size)
         
-        # scatter_add_ 是0.5中的函数，0.4中还未发布
+        # scatter_add_ 是0.4.1中的函数
         prob_c = torch.zeros(b, self.vocab_size, device=device_cuda).scatter_add_(1, encoder_input_ids, copy_score)  # (b, vocab_size)
-        '''
-        prob_c = torch.zeros(b, self.vocab_size, device=device_cuda)
-        for b_idx in range(b):
-            for l_idx in range(l):
-                prob_c[b_idx, encoder_input_ids[b_idx, l_idx]] += copy_score[b_idx, l_idx]
-        '''
 
         output = prob_g + prob_c  # (b, vocab_size)
-        output[output == 0] = float('-inf')  # 将概率为0的项替换成-inf
         output = torch.log(output)  # (b, vocab_size)
-        output[torch.isnan(output)] = float('-inf')  # 将nan替换成-inf
 
-        # output = F.log_softmax(generate_score, dim=1)  # (b, dec_vocab_size)
+        # output = F.log_softmax(generate_score, dim=1)  # (b, vocab_size)
         return output, cur_hidden, cur_attention
 
 
@@ -354,7 +356,7 @@ def beam_search(embedding, decoder, decoder_input_id, decoder_input, encoder_out
     :param decoder_input: (b, 1, embed)
     :param encoder_outputs: (b, l, hidden)
     :param encoder_input_ids: (b, l)
-    :param decoder_hidden: (b, 1, hidden)
+    :param decoder_hidden: (num_layers, b, hidden)
     :param decoder_attention: (b, 1, hidden)
     :return:
     '''
@@ -433,7 +435,7 @@ def train(input, input_lens, target, target_lens, embedding, encoder, decoder, o
     b = len(input)
 
     encoder_input = embedding(input)  # (b, l, embed)
-    encoder_outputs, decoder_hidden = encoder.module.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (b, 1, hidden)
+    encoder_outputs, decoder_hidden = encoder.module.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (num_layers, b, hidden)
 
     decoder_input_id = torch.zeros(b, 1, dtype=torch.long, device=device_cuda).fill_(SOS_token)  # (b, 1)
     decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
@@ -462,7 +464,7 @@ def train(input, input_lens, target, target_lens, embedding, encoder, decoder, o
     return loss.data.item() / target[0].numel()
 
 
-def inference(lang, input, input_lens, embedding, encoder, decoder, max_length, bms=True):
+def inference(lang, input, input_lens, embedding, encoder, decoder, max_length, bms=False):
     with torch.no_grad():
         # Inference mode (disable dropout)
         encoder.eval()
@@ -471,7 +473,7 @@ def inference(lang, input, input_lens, embedding, encoder, decoder, max_length, 
         b = len(input)
 
         encoder_input = embedding(input)  # (b, l, embed)
-        encoder_outputs, decoder_hidden = encoder.module.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (b, 1, hidden)
+        encoder_outputs, decoder_hidden = encoder.module.pack_unpack(encoder_input, input_lens)  # (b, l, hidden), (num_layers, b, hidden)
 
         decoder_input_id = torch.zeros(b, 1, dtype=torch.long, device=device_cuda).fill_(SOS_token)  # (b, 1)
         decoder_input = embedding(decoder_input_id)  # (b, 1, embed)
@@ -512,7 +514,7 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
     print_loss_total = 0  # Reset every print_every
     plot_loss_total = 0  # Reset every plot_every
     best_bleu_score = 0.0
-    criterion = nn.NLLLoss()
+    criterion = nn.NLLLoss(ignore_index=0)
 
     # 在有Model时预先生成best_bleu_score
     print("============evaluate_start==================")
@@ -543,14 +545,14 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
                     print('new model saved.')
                 print("==============evaluate_end==================")
 
-            print("batch: ", i)
+            # print("batch: ", i)
             # 排序并padding
             training_batch = sorted(training_batch, key=lambda x: len(x[0]), reverse=True)
             training_batch = list(map(lambda x: indexesFromPair(lang, x), training_batch))
             enc_lens = list(map(lambda x: len(x[0]), training_batch))
             dec_lens = list(map(lambda x: len(x[1]), training_batch))
-            print("enc_lens: ", enc_lens)
-            print("dec_lens: ", dec_lens)
+            # print("enc_lens: ", enc_lens)
+            # print("dec_lens: ", dec_lens)
             enc_max_len = max(enc_lens)
             dec_max_len = max(dec_lens)
             enc = []
@@ -593,14 +595,14 @@ def evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_bat
     target_words = []
     decoded_words = []
     for i in range(0, len(dev_pairs), infer_batch_size):
-        print("batch: ", int(i / infer_batch_size))
+        # print("batch: ", int(i / infer_batch_size))
         dev_batch = dev_pairs[i:i + infer_batch_size]
         # 排序并padding
         dev_batch = sorted(dev_batch, key=lambda x: len(x[0]), reverse=True)
         target_words.extend(map(lambda x: x[1], dev_batch))
         dev_batch = list(map(lambda x: indexesFromPair(lang, x), dev_batch))
         enc_lens = list(map(lambda x: len(x[0]), dev_batch))
-        print("enc_lens: ", enc_lens)
+        # print("enc_lens: ", enc_lens)
         enc_max_len = max(enc_lens)
         enc = []
         for t in dev_batch:
@@ -623,17 +625,18 @@ def evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_bat
     return bleu_score
 
 # 实际的序列会多一个终止token
-ENC_MAX_LEN = 3000
-DEC_MAX_LEN = 500
+ENC_MAX_LEN = 1200
+DEC_MAX_LEN = 150
 max_length = DEC_MAX_LEN + 1
 
-n_epochs = 4
+n_epochs = 20
 lr = 0.001
 batch_size = 16
-infer_batch_size = 1
+infer_batch_size = 512
 embed_size = 300
 hidden_size = 256
-dropout_p = 0.1
+dropout_p = 0.5
+num_layers = 2
 
 
 def run_train():
@@ -730,9 +733,9 @@ def run_train():
     # 共用一套embedding
     embed = init_embedding(embed_size, vocab_word.n_words, vocab_word.word2index)
     embedding = nn.Embedding(vocab_word.n_words, embed_size, padding_idx=0).from_pretrained(embed, freeze=False)
-    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size // 2)
+    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size // 2, num_layers=num_layers, dropout_p=dropout_p)
     attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, vocab_word.n_words_for_decoder, vocab_word.n_words,
-                                     dropout_p=dropout_p)
+                                     num_layers=num_layers, dropout_p=dropout_p)
 
     embedding = torch.nn.DataParallel(embedding).to(device_cuda)
     encoder = torch.nn.DataParallel(encoder).to(device_cuda)
@@ -776,9 +779,9 @@ def run_prediction(input_file_path, output_file_path):
 
     # 共用一套embedding
     embedding = nn.Embedding(vocab_word.n_words, embed_size, padding_idx=0)
-    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size // 2)
+    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size // 2, num_layers=num_layers, dropout_p=dropout_p)
     attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, vocab_word.n_words_for_decoder, vocab_word.n_words,
-                                     dropout_p=dropout_p)
+                                     num_layers=num_layers, dropout_p=dropout_p)
 
     embedding = torch.nn.DataParallel(embedding).to(device_cuda)
     encoder = torch.nn.DataParallel(encoder).to(device_cuda)
@@ -797,7 +800,7 @@ def run_prediction(input_file_path, output_file_path):
         enc = [s]
         enc = torch.tensor(enc, dtype=torch.long, device=device_cuda)
         enc_lens = [len(s)]
-        result = inference(vocab_word, enc, enc_lens, embedding, encoder, attn_decoder, max_length)
+        result = inference(vocab_word, enc, enc_lens, embedding, encoder, attn_decoder, max_length, bms=True)
         print(result)
         decoded_words.extend(result)
 
