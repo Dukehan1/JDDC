@@ -24,7 +24,7 @@ SOS_token = 2
 EOS_token = 3
 
 
-VECTOR_DIR = 'data/sgns.merge.word'
+VECTOR_DIR = 'embed/sgns.merge.word'
 
 
 def init_embedding(embed_size, n_word, word2index):
@@ -90,8 +90,11 @@ class Lang:
 # Regular expressions used to tokenize.
 _DIGIT_RE = re.compile("\d+")
 special_words = [
-    '<s>', '#E-s', '[USERID_0]', '[ORDERID_0]', '[数字x]', '[金额x]', '[日期x]', '[时间x]', 
-    '[电话x]', '[地址x]', '[站点x]', '[姓名x]', '[邮箱x]', '[身份证号x]', '[链接x]', '[组织机构x]'
+    '<s>', '#E-s', '[USERID_0]', '[ORDERID_0]', '[数字x]', '[金额x]', '[日期x]', '[时间x]',
+    '[电话x]', '[地址x]', '[站点x]', '[姓名x]', '[邮箱x]', '[身份证号x]', '[链接x]', '[组织机构x]',
+    '<ORDER_1_N>', '<ORDER_1_1>', '<ORDER_1_2>', '<ORDER_1_3>', '<ORDER_1_4>',
+    '<USER_1_N>', '<USER_1_e>', '<USER_1_q>', '<USER_1_r>', '<USER_1_t>', '<USER_1_w>',
+    '<USER_2_N>', '<USER_2_0>', '<USER_2_2>', '<USER_2_3>', '<USER_2_4>', '<USER_2_5>', '<USER_2_6>',
 ]
 
 
@@ -117,19 +120,18 @@ def char_tokenizer(sentence):
     return tokens
 
 
-def prepare_vocabulary(tokenizer, files, cut=3):
+def prepare_vocabulary(data, cut=3):
     # 生成词表，前半部分仅供decoder使用，整体供encoder使用
     lang = Lang('zh-cn')
     # 仅使用训练集统计
-    files = {
-        'trainAnswers': files['trainAnswers'],
-        'trainQuestions': files['trainQuestions']
+    data = {
+        'trainAnswers': data['trainAnswers'],
+        'trainQuestions': data['trainQuestions']
     }
-    for f in files:
-        lines = files[f]
+    for f in data:
+        lines = data[f]
         for line in lines:
-            tokens = tokenizer(line)
-            lang.addSentence(tokens)
+            lang.addSentence(line)
         # 记录Decoder词表的大小
         if f == 'trainAnswers':
             lang.updateDecoderWords()
@@ -156,19 +158,6 @@ def prepare_vocabulary(tokenizer, files, cut=3):
         lang.index2word.append(i[0])
 
     return lang
-
-
-def prepare_data(tokenizer, files):
-    # data_to_token_ids
-    data = {}
-    for f in files:
-        data[f] = []
-        lines = files[f]
-        for line in lines:
-            tokens = tokenizer(line)
-            data[f].append(tokens)
-
-    return data
 
 
 def indexesFromSentence(lang, sentence):
@@ -229,7 +218,7 @@ class CopynetDecoderRNN(nn.Module):
                            dropout=self.dropout_p)
         self.attn = nn.Linear(hidden_size, hidden_size)
         self.attn_combine = nn.Linear(hidden_size * 2, hidden_size)
-        self.gen_out = nn.Linear(hidden_size, vocab_size)
+        self.gen_out = nn.Linear(hidden_size, dec_vocab_size)
         self.copy_out = nn.Linear(self.hidden_size, self.hidden_size)
 
     def forward(self, input_id, input, encoder_outputs, encoder_input_ids, hidden, attention):
@@ -262,7 +251,7 @@ class CopynetDecoderRNN(nn.Module):
         cur_attention = torch.tanh(
             self.attn_combine(torch.cat((attn_applied, o), 2)))  # (b, 1, hidden)
 
-        generate_score = self.gen_out(cur_attention).squeeze(1)  # (b, vocab_size)
+        generate_score = self.gen_out(cur_attention).squeeze(1)  # (b, dec_vocab_size)
 
         # CopyNet
         copy_weights = torch.sigmoid(self.copy_out(encoder_outputs))  # (b, l, hidden)
@@ -270,15 +259,17 @@ class CopynetDecoderRNN(nn.Module):
             encoder_input_ids_mask, -float('inf'))  # (b, l)
 
         score = F.softmax(torch.cat((generate_score, copy_score), 1), dim=1)
-        generate_score, copy_score = torch.split(score, (self.vocab_size, l), 1)
+        generate_score, copy_score = torch.split(score, (self.dec_vocab_size, l), 1)
 
-        prob_g = generate_score  # (b, vocab_size)
+        prob_g = torch.cat((generate_score, torch.zeros(b, self.vocab_size - self.dec_vocab_size, device=device_cuda)), 1)  # (b, vocab_size)
         
         # scatter_add_ 是0.4.1中的函数
         prob_c = torch.zeros(b, self.vocab_size, device=device_cuda).scatter_add_(1, encoder_input_ids, copy_score)  # (b, vocab_size)
 
         output = prob_g + prob_c  # (b, vocab_size)
+        output.masked_fill_(output == 0, float('-inf'))  # 将概率为0的项替换成-inf
         output = torch.log(output)  # (b, vocab_size)
+        output.masked_fill_(torch.isnan(output), float('-inf'))  # 将nan替换成-inf
 
         # output = F.log_softmax(generate_score, dim=1)  # (b, vocab_size)
         return output, cur_hidden, cur_attention
@@ -461,7 +452,7 @@ def train(input, input_lens, target, target_lens, embedding, encoder, decoder, o
 
     optimizer.step()
 
-    return loss.data.item() / target[0].numel()
+    return loss.data.item() / len(target[0])
 
 
 def inference(lang, input, input_lens, embedding, encoder, decoder, max_length, bms=False):
@@ -532,7 +523,7 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
     for iter in range(1, n_iters + 1):
         print("======================iter%s============================" % iter)
         for i, training_batch in enumerate(get_minibatches(train_pairs, batch_size)):
-            if i % 10000 == 0 and i != 0:
+            if i % 5000 == 0 and i != 0:
                 print("============evaluate_start==================")
                 bleu_score = evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_batch_size)
                 print('bleu_socre: {0}'.format(bleu_score))
@@ -625,62 +616,43 @@ def evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_bat
     return bleu_score
 
 # 实际的序列会多一个终止token
-ENC_MAX_LEN = 1200
-DEC_MAX_LEN = 150
+ENC_MAX_LEN = 700
+DEC_MAX_LEN = 70
 max_length = DEC_MAX_LEN + 1
 
 n_epochs = 20
 lr = 0.001
-batch_size = 16
+batch_size = 64
 infer_batch_size = 512
 embed_size = 300
 hidden_size = 256
-dropout_p = 0.5
-num_layers = 2
+dropout_p = 0.2
+num_layers = 3
 
 
 def run_train():
-    # 从10份中取一份作dev
-    dev_id = 0
-    files = {
+    data = {
         'trainAnswers': [],
         'devAnswers': [],
         'trainQuestions': [],
         'devQuestions': []
     }
-    train_idx = list(filter(lambda x: x != dev_id, range(10)))
-    for i in train_idx:
-        files['trainAnswers'].extend(
-            open('data/answers-' + str(i) + '.txt', encoding="utf-8").read().strip().split('\n'))
-        files['trainQuestions'].extend(
-            open('data/questions-' + str(i) + '.txt', encoding="utf-8").read().strip().split('\n'))
-    files['devAnswers'].extend(
-        open('data/answers-' + str(dev_id) + '.txt', encoding="utf-8").read().strip().split('\n'))
-    files['devQuestions'].extend(
-        open('data/questions-' + str(dev_id) + '.txt', encoding="utf-8").read().strip().split('\n'))
+    data['trainAnswers'].extend(
+        map(lambda x: x.split(' '), open('opennmt/train.txt.tgt', encoding="utf-8").read().strip().split('\n')))
+    data['trainQuestions'].extend(
+        map(lambda x: x.split(' '), open('opennmt/train.txt.src', encoding="utf-8").read().strip().split('\n')))
+    data['devAnswers'].extend(
+        map(lambda x: x.split(' '), open('opennmt/val.txt.tgt', encoding="utf-8").read().strip().split('\n')))
+    data['devQuestions'].extend(
+        map(lambda x: x.split(' '), open('opennmt/val.txt.src', encoding="utf-8").read().strip().split('\n')))
 
     # for debug
     '''
-    files['trainAnswers'] = files['trainAnswers'][:5]
-    files['trainQuestions'] = files['trainQuestions'][:5]
-    files['devAnswers'] = files['trainAnswers']
-    files['devQuestions'] = files['trainQuestions']
+    data['trainAnswers'] = data['trainAnswers'][:5]
+    data['trainQuestions'] = data['trainQuestions'][:5]
+    data['devAnswers'] = data['trainAnswers']
+    data['devQuestions'] = data['trainQuestions']
     '''
-
-    # 生成词表（char）
-    if os.path.exists('model/vocab_char'):
-        t = open('model/vocab_char', 'rb')
-        vocab_char = pickle.load(t)
-        t.close()
-    else:
-        vocab_char = prepare_vocabulary(char_tokenizer, files, cut=3)
-        t = open('model/vocab_char', 'wb')
-        pickle.dump(vocab_char, t)
-        t.close()
-    print("========================char===========================")
-    print('dec_vocab_size: ', vocab_char.n_words_for_decoder)
-    print('vocab_size: ', vocab_char.n_words)
-    print('max_word_length: ', max(map(lambda x: len(x), vocab_char.word2index)))
 
     # 生成词表（word）
     if os.path.exists('model/vocab_word'):
@@ -688,7 +660,7 @@ def run_train():
         vocab_word = pickle.load(t)
         t.close()
     else:
-        vocab_word = prepare_vocabulary(word_tokenizer, files, cut=3)
+        vocab_word = prepare_vocabulary(data, cut=3)
         t = open('model/vocab_word', 'wb')
         pickle.dump(vocab_word, t)
         t.close()
@@ -697,16 +669,7 @@ def run_train():
     print('vocab_size: ', vocab_word.n_words)
     print('max_word_length: ', max(map(lambda x: len(x), vocab_word.word2index)))
 
-    # 生成数据（截断过长数据）
-    if os.path.exists('model/data'):
-        t = open('model/data', 'rb')
-        data = pickle.load(t)
-        t.close()
-    else:
-        data = prepare_data(word_tokenizer, files)
-        t = open('model/data', 'wb')
-        pickle.dump(data, t)
-        t.close()
+    # 生成数据
     train_pairs = []
     dev_pairs = []
     for i in range(len(data['trainQuestions'])):
@@ -759,15 +722,6 @@ def run_train():
 
 
 def run_prediction(input_file_path, output_file_path):
-    # 生成词表（char）
-    t = open('model/vocab_char', 'rb')
-    vocab_char = pickle.load(t)
-    t.close()
-    print("========================char===========================")
-    print('dec_vocab_size: ', vocab_char.n_words_for_decoder)
-    print('vocab_size: ', vocab_char.n_words)
-    print('max_word_length: ', max(map(lambda x: len(x), vocab_char.word2index)))
-
     # 生成词表（word）
     t = open('model/vocab_word', 'rb')
     vocab_word = pickle.load(t)
