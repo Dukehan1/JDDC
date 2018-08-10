@@ -88,9 +88,12 @@ class Lang:
 
 
 # Regular expressions used to tokenize.
-_DIGIT_RE = re.compile("\d+")
+_ORDER_RE = re.compile("\[ORDERID_\d+\]")
+_USER_RE = re.compile("\[USERID_\d+\]")
+_URL_RE = re.compile("http(s?)://item.jd.com/(\d+|\[数字x\]).html")
 special_words = [
-    '<s>', '#E-s', '[USERID_0]', '[ORDERID_0]', '[数字x]', '[金额x]', '[日期x]', '[时间x]',
+    '<s>', '#E-s', 'https://item.jd.com/[数字x].html',
+    '[USERID_0]', '[ORDERID_0]', '[数字x]', '[金额x]', '[日期x]', '[时间x]',
     '[电话x]', '[地址x]', '[站点x]', '[姓名x]', '[邮箱x]', '[身份证号x]', '[链接x]', '[组织机构x]',
     '<ORDER_1_N>', '<ORDER_1_1>', '<ORDER_1_2>', '<ORDER_1_3>', '<ORDER_1_4>',
     '<USER_1_N>', '<USER_1_e>', '<USER_1_q>', '<USER_1_r>', '<USER_1_t>', '<USER_1_w>',
@@ -100,7 +103,9 @@ special_words = [
 
 def word_tokenizer(sentence):
     # word level
-    sentence = re.sub(_DIGIT_RE, "0", sentence)
+    sentence = re.sub(_ORDER_RE, "[ORDERID_0]", sentence)
+    sentence = re.sub(_USER_RE, "[USERID_0]", sentence)
+    sentence = re.sub(_URL_RE, "https://item.jd.com/[数字x].html", sentence)
     chunks = re.split(r'(' + '|'.join(special_words).replace('[', '\[').replace(']', '\]') + ')', sentence)
     tokens = []
     for c in chunks:
@@ -108,14 +113,6 @@ def word_tokenizer(sentence):
             tokens.extend(list(jieba.cut(c)))
         else:
             tokens.append(c)
-    tokens = [word for word in tokens if word]
-    return tokens
-
-
-def char_tokenizer(sentence):
-    # char level
-    sentence = re.sub(_DIGIT_RE, "0", sentence)
-    tokens = list(sentence)
     tokens = [word for word in tokens if word]
     return tokens
 
@@ -173,28 +170,36 @@ def indexesFromPair(lang, pair):
 
 
 class EncoderRNN(nn.Module):
-    def __init__(self, embed_size, vocab_size, hidden_size, num_layers=2, dropout_p=0.5):
+    def __init__(self, embed_size, vocab_size, hidden_size, bidirectional=True, num_layers=2, dropout_p=0.5):
         super(EncoderRNN, self).__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout_p = dropout_p
+        self.bidirectional = bidirectional
 
-        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers=self.num_layers, batch_first=True, bidirectional=True,
-                           dropout=self.dropout_p)
+        if self.bidirectional:
+            self.lstm = nn.LSTM(embed_size, hidden_size // 2, num_layers=self.num_layers, batch_first=True,
+                                bidirectional=True, dropout=self.dropout_p)
+        else:
+            self.lstm = nn.LSTM(embed_size, hidden_size, num_layers=self.num_layers, batch_first=True,
+                                bidirectional=False, dropout=self.dropout_p)
 
     def forward(self, input):
         '''
         :param input: (b, l, embed)
         :return:
         '''
-        output, (h_n, c_n) = self.lstm(input)  # (b, l, hidden * 2), (num_layers * 2, b, hidden)
-        h_n = h_n.transpose(0, 1)
-        h_n = h_n.reshape(-1, self.num_layers, self.hidden_size * 2)
-        h_n = h_n.transpose(0, 1)  # (num_layers, b, hidden * 2)
-        c_n = c_n.transpose(0, 1)
-        c_n = c_n.reshape(-1, self.num_layers, self.hidden_size * 2)
-        c_n = c_n.transpose(0, 1)  # (num_layers, b, hidden * 2)
+        # bidirectional = True: (b, l, hidden), (num_layers * 2, b, hidden / 2)
+        # bidirectional = False: (b, l, hidden), (num_layers, b, hidden)
+        output, (h_n, c_n) = self.lstm(input)
+        if self.bidirectional:
+            h_n = h_n.transpose(0, 1)
+            h_n = h_n.reshape(-1, self.num_layers, self.hidden_size)
+            h_n = h_n.transpose(0, 1)  # (num_layers, b, hidden)
+            c_n = c_n.transpose(0, 1)
+            c_n = c_n.reshape(-1, self.num_layers, self.hidden_size)
+            c_n = c_n.transpose(0, 1)  # (num_layers, b, hidden)
 
         return output, (h_n, c_n)
 
@@ -523,7 +528,7 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
     for iter in range(1, n_iters + 1):
         print("======================iter%s============================" % iter)
         for i, training_batch in enumerate(get_minibatches(train_pairs, batch_size)):
-            if i % 5000 == 0 and i != 0:
+            if i % 10000 == 0 and i != 0:
                 print("============evaluate_start==================")
                 bleu_score = evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_batch_size)
                 print('bleu_socre: {0}'.format(bleu_score))
@@ -616,19 +621,20 @@ def evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_bat
     return bleu_score
 
 # 实际的序列会多一个终止token
-ENC_MAX_LEN = 1000
-DEC_MAX_LEN = 100
+ENC_MAX_LEN = 800
+DEC_MAX_LEN = 150
 max_length = DEC_MAX_LEN + 1
 
-n_epochs = 20
+n_epochs = 40
 lr = 0.001
-batch_size = 64
+batch_size = 32
 infer_batch_size = 512
 embed_size = 300
 hidden_size = 256
-dropout_p = 0.2
+bidirectional = True
+dropout_p = 0.3
 num_layers = 3
-
+cut = 8
 
 def run_train():
     data = {
@@ -660,7 +666,7 @@ def run_train():
         vocab_word = pickle.load(t)
         t.close()
     else:
-        vocab_word = prepare_vocabulary(data, cut=3)
+        vocab_word = prepare_vocabulary(data, cut=cut)
         t = open('model/vocab_word', 'wb')
         pickle.dump(vocab_word, t)
         t.close()
@@ -669,7 +675,7 @@ def run_train():
     print('vocab_size: ', vocab_word.n_words)
     print('max_word_length: ', max(map(lambda x: len(x), vocab_word.word2index)))
 
-    # 生成数据
+    # 生成数据（截断）
     train_pairs = []
     dev_pairs = []
     for i in range(len(data['trainQuestions'])):
@@ -696,7 +702,8 @@ def run_train():
     # 共用一套embedding
     embed = init_embedding(embed_size, vocab_word.n_words, vocab_word.word2index)
     embedding = nn.Embedding(vocab_word.n_words, embed_size, padding_idx=0).from_pretrained(embed, freeze=False)
-    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size // 2, num_layers=num_layers, dropout_p=dropout_p)
+    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size, bidirectional=bidirectional,
+                         num_layers=num_layers, dropout_p=dropout_p)
     attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, vocab_word.n_words_for_decoder, vocab_word.n_words,
                                      num_layers=num_layers, dropout_p=dropout_p)
 
@@ -733,7 +740,8 @@ def run_prediction(input_file_path, output_file_path):
 
     # 共用一套embedding
     embedding = nn.Embedding(vocab_word.n_words, embed_size, padding_idx=0)
-    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size // 2, num_layers=num_layers, dropout_p=dropout_p)
+    encoder = EncoderRNN(embed_size, vocab_word.n_words, hidden_size, bidirectional=bidirectional,
+                         num_layers=num_layers, dropout_p=dropout_p)
     attn_decoder = CopynetDecoderRNN(embed_size, hidden_size, vocab_word.n_words_for_decoder, vocab_word.n_words,
                                      num_layers=num_layers, dropout_p=dropout_p)
 
