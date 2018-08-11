@@ -6,6 +6,9 @@ import re
 
 from sklearn.model_selection import KFold
 
+_ORDER_RE = re.compile("\[(ORDERID_\d+)\]")
+_USER_RE = re.compile("\[(USERID_\d+)\]")
+_URL_RE = re.compile("https?://item.jd.com/(\d+|\[数字x\]).html")
 
 def data_processing():
 
@@ -127,13 +130,13 @@ def data_processing():
                                 if user_id in user:
                                     user_1 = '<USER_1_' + user[user_id][1] + '>'
                                     user_2 = '<USER_2_' + user[user_id][3] + '>'
-                                if re.search('http://item.jd.com/(\d+).html', temp[6]):
-                                    sku_id = re.search('http://item.jd.com/(\d+).html', temp[6]).group(1)
+                                if re.search(_URL_RE, temp[6]):
+                                    sku_id = re.search(_URL_RE, temp[6]).group(1)
                                     if sku_id in sku:
                                         sku_1 = sku[sku_id][1]
                                         sku_2 = sku[sku_id][2]
-                                if re.search('\[(ORDERID_\d+)\]', temp[6]):
-                                    order_id = re.search('\[(ORDERID_\d+)\]', temp[6]).group(1)
+                                if re.search(_ORDER_RE, temp[6]):
+                                    order_id = re.search(_ORDER_RE, temp[6]).group(1)
                                     if order_id in order:
                                         sku_1s = []
                                         sku_2s = []

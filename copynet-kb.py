@@ -1,5 +1,4 @@
 # -*- coding: UTF-8 -*-
-import jieba
 import numpy as np
 import re
 import random
@@ -15,6 +14,8 @@ import pickle
 from nltk.translate.bleu_score import sentence_bleu
 from nltk.translate.bleu_score import SmoothingFunction
 
+from dataToOpenNMT import word_tokenizer, sentence_with_kb
+
 device_cuda = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 device_cpu = torch.device("cpu")
 
@@ -28,8 +29,8 @@ VECTOR_DIR = 'embed/sgns.merge.word'
 
 
 def init_embedding(embed_size, n_word, word2index):
-    if os.path.exists('model/pretrained'):
-        t = open('model/pretrained', 'rb')
+    if os.path.exists('model_copynet/pretrained'):
+        t = open('model_copynet/pretrained', 'rb')
         embeddings = pickle.load(t)
         t.close()
     else:
@@ -54,7 +55,7 @@ def init_embedding(embed_size, n_word, word2index):
                 print('out: ', word)
         print("took {:.2f} seconds\n".format(time.time() - start))
 
-        t = open('model/pretrained', 'wb')
+        t = open('model_copynet/pretrained', 'wb')
         pickle.dump(embeddings, t)
         t.close()
     return torch.tensor(embeddings, device=device_cpu)
@@ -85,36 +86,6 @@ class Lang:
     def updateDecoderWords(self):
         # 记录Decoder词表的大小
         self.n_words_for_decoder = self.n_words
-
-
-# Regular expressions used to tokenize.
-_ORDER_RE = re.compile("\[ORDERID_\d+\]")
-_USER_RE = re.compile("\[USERID_\d+\]")
-_URL_RE = re.compile("http(s?)://item.jd.com/(\d+|\[数字x\]).html")
-special_words = [
-    '<s>', '#E-s', 'https://item.jd.com/[数字x].html',
-    '[USERID_0]', '[ORDERID_0]', '[数字x]', '[金额x]', '[日期x]', '[时间x]',
-    '[电话x]', '[地址x]', '[站点x]', '[姓名x]', '[邮箱x]', '[身份证号x]', '[链接x]', '[组织机构x]',
-    '<ORDER_1_N>', '<ORDER_1_1>', '<ORDER_1_2>', '<ORDER_1_3>', '<ORDER_1_4>',
-    '<USER_1_N>', '<USER_1_e>', '<USER_1_q>', '<USER_1_r>', '<USER_1_t>', '<USER_1_w>',
-    '<USER_2_N>', '<USER_2_0>', '<USER_2_2>', '<USER_2_3>', '<USER_2_4>', '<USER_2_5>', '<USER_2_6>',
-]
-
-
-def word_tokenizer(sentence):
-    # word level
-    sentence = re.sub(_ORDER_RE, "[ORDERID_0]", sentence)
-    sentence = re.sub(_USER_RE, "[USERID_0]", sentence)
-    sentence = re.sub(_URL_RE, "https://item.jd.com/[数字x].html", sentence)
-    chunks = re.split(r'(' + '|'.join(special_words).replace('[', '\[').replace(']', '\]') + ')', sentence)
-    tokens = []
-    for c in chunks:
-        if c not in special_words:
-            tokens.extend(list(jieba.cut(c)))
-        else:
-            tokens.append(c)
-    tokens = [word for word in tokens if word]
-    return tokens
 
 
 def prepare_vocabulary(data, cut=3):
@@ -518,11 +489,11 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
     print('bleu_socre: {0}'.format(bleu_score))
     if bleu_score >= best_bleu_score:
         best_bleu_score = bleu_score
-        torch.save(encoder.state_dict(), 'model/encoder')
-        torch.save(decoder.state_dict(), 'model/decoder')
-        torch.save(embedding.state_dict(), 'model/embedding')
-        torch.save(optimizer.state_dict(), 'model/optimizer')
-        print('new model saved.')
+        torch.save(encoder.state_dict(), 'model_copynet/encoder')
+        torch.save(decoder.state_dict(), 'model_copynet/decoder')
+        torch.save(embedding.state_dict(), 'model_copynet/embedding')
+        torch.save(optimizer.state_dict(), 'model_copynet/optimizer')
+        print('new model_copynet saved.')
     print("==============evaluate_end==================")
 
     for iter in range(1, n_iters + 1):
@@ -534,11 +505,11 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
                 print('bleu_socre: {0}'.format(bleu_score))
                 if bleu_score >= best_bleu_score:
                     best_bleu_score = bleu_score
-                    torch.save(encoder.state_dict(), 'model/encoder')
-                    torch.save(decoder.state_dict(), 'model/decoder')
-                    torch.save(embedding.state_dict(), 'model/embedding')
-                    torch.save(optimizer.state_dict(), 'model/optimizer')
-                    print('new model saved.')
+                    torch.save(encoder.state_dict(), 'model_copynet/encoder')
+                    torch.save(decoder.state_dict(), 'model_copynet/decoder')
+                    torch.save(embedding.state_dict(), 'model_copynet/embedding')
+                    torch.save(optimizer.state_dict(), 'model_copynet/optimizer')
+                    print('new model_copynet saved.')
                 print("==============evaluate_end==================")
 
             # print("batch: ", i)
@@ -579,11 +550,11 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
         print('bleu_socre: {0}'.format(bleu_score))
         if bleu_score >= best_bleu_score:
             best_bleu_score = bleu_score
-            torch.save(encoder.state_dict(), 'model/encoder')
-            torch.save(decoder.state_dict(), 'model/decoder')
-            torch.save(embedding.state_dict(), 'model/embedding')
-            torch.save(optimizer.state_dict(), 'model/optimizer')
-            print('new model saved.')
+            torch.save(encoder.state_dict(), 'model_copynet/encoder')
+            torch.save(decoder.state_dict(), 'model_copynet/decoder')
+            torch.save(embedding.state_dict(), 'model_copynet/embedding')
+            torch.save(optimizer.state_dict(), 'model_copynet/optimizer')
+            print('new model_copynet saved.')
         print("==============evaluate_end==================")
 
 
@@ -654,20 +625,20 @@ def run_train():
 
     # for debug
     '''
-    data['trainAnswers'] = data['trainAnswers'][:5]
-    data['trainQuestions'] = data['trainQuestions'][:5]
-    data['devAnswers'] = data['trainAnswers']
-    data['devQuestions'] = data['trainQuestions']
+    data['trainAnswers'] = data['trainAnswers'][:2]
+    data['trainQuestions'] = data['trainQuestions'][:2]
+    data['devAnswers'] = [list(x) for x in data['trainAnswers']]
+    data['devQuestions'] = [list(x) for x in data['trainQuestions']]
     '''
 
     # 生成词表（word）
-    if os.path.exists('model/vocab_word'):
-        t = open('model/vocab_word', 'rb')
+    if os.path.exists('model_copynet/vocab_word'):
+        t = open('model_copynet/vocab_word', 'rb')
         vocab_word = pickle.load(t)
         t.close()
     else:
         vocab_word = prepare_vocabulary(data, cut=cut)
-        t = open('model/vocab_word', 'wb')
+        t = open('model_copynet/vocab_word', 'wb')
         pickle.dump(vocab_word, t)
         t.close()
     print("========================word===========================")
@@ -711,18 +682,18 @@ def run_train():
     encoder = torch.nn.DataParallel(encoder).to(device_cuda)
     attn_decoder = torch.nn.DataParallel(attn_decoder).to(device_cuda)
 
-    if os.path.isfile('model/embedding'):
-        embedding.load_state_dict(torch.load('model/embedding'))
+    if os.path.isfile('model_copynet/embedding'):
+        embedding.load_state_dict(torch.load('model_copynet/embedding'))
 
-    if os.path.isfile('model/encoder') and os.path.isfile('model/decoder'):
-        encoder.load_state_dict(torch.load('model/encoder'))
-        attn_decoder.load_state_dict(torch.load('model/decoder'))
+    if os.path.isfile('model_copynet/encoder') and os.path.isfile('model_copynet/decoder'):
+        encoder.load_state_dict(torch.load('model_copynet/encoder'))
+        attn_decoder.load_state_dict(torch.load('model_copynet/decoder'))
 
     optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": encoder.parameters()},
                             {"params": attn_decoder.parameters()}], lr=lr, amsgrad=True)
 
-    if os.path.isfile('model/optimizer'):
-        optimizer.load_state_dict(torch.load('model/optimizer'))
+    if os.path.isfile('model_copynet/optimizer'):
+        optimizer.load_state_dict(torch.load('model_copynet/optimizer'))
 
     trainIters(vocab_word, embedding, encoder, attn_decoder, optimizer, train_pairs, dev_pairs, max_length, n_epochs, lr,
                batch_size, infer_batch_size, print_every=1)
@@ -730,7 +701,7 @@ def run_train():
 
 def run_prediction(input_file_path, output_file_path):
     # 生成词表（word）
-    t = open('model/vocab_word', 'rb')
+    t = open('model_copynet/vocab_word', 'rb')
     vocab_word = pickle.load(t)
     t.close()
     print("========================word===========================")
@@ -749,12 +720,17 @@ def run_prediction(input_file_path, output_file_path):
     encoder = torch.nn.DataParallel(encoder).to(device_cuda)
     attn_decoder = torch.nn.DataParallel(attn_decoder).to(device_cuda)
 
-    embedding.load_state_dict(torch.load('model/embedding', map_location='cpu'))
-    encoder.load_state_dict(torch.load('model/encoder', map_location='cpu'))
-    attn_decoder.load_state_dict(torch.load('model/decoder', map_location='cpu'))
+    embedding.load_state_dict(torch.load('model_copynet/embedding', map_location='cpu'))
+    encoder.load_state_dict(torch.load('model_copynet/encoder', map_location='cpu'))
+    attn_decoder.load_state_dict(torch.load('model_copynet/decoder', map_location='cpu'))
 
-    input_file = open(input_file_path, encoding="utf-8").read().strip().split('\n')
-    input_data = list(map(lambda x: word_tokenizer(x), input_file))
+    input_data = open(input_file_path, encoding="utf-8").read().strip().split('\n')
+    print(input_data)
+    # 添加KB
+    input_data = list(map(lambda x: sentence_with_kb(x), input_data))
+    # 分词
+    input_data = list(map(lambda x: word_tokenizer(x), input_data))
+    print(input_data)
 
     decoded_words = []
     for s in input_data:
@@ -763,6 +739,7 @@ def run_prediction(input_file_path, output_file_path):
         enc = torch.tensor(enc, dtype=torch.long, device=device_cuda)
         enc_lens = [len(s)]
         result = inference(vocab_word, enc, enc_lens, embedding, encoder, attn_decoder, max_length, bms=True)
+        # TODO：是否替换''
         print(result)
         decoded_words.extend(result)
 
