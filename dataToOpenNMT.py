@@ -98,7 +98,7 @@ def word_tokenizer(sentence):
             tokens.extend(list(jieba.cut(c)))
         else:
             tokens.append(c)
-    # 将' '全部替换成''，否则文件无法处理
+    # 统一表示，将' '全部替换成''
     tokens = [word.strip() for word in tokens if word]
     return tokens
 

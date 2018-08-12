@@ -468,7 +468,9 @@ def inference(lang, input, input_lens, embedding, encoder, decoder, max_length, 
             sentence = []
             for w in s:
                 if w != EOS_token:
-                    sentence.append(lang.index2word[w])
+                    # 模型中' '会被当成''，这一步需要再替换回来
+                    temp = lang.index2word[w] if lang.index2word[w] != '' else ' '
+                    sentence.append(temp)
                 else:
                     break
             decoded_words.append(sentence)
@@ -739,7 +741,6 @@ def run_prediction(input_file_path, output_file_path):
         enc = torch.tensor(enc, dtype=torch.long, device=device_cuda)
         enc_lens = [len(s)]
         result = inference(vocab_word, enc, enc_lens, embedding, encoder, attn_decoder, max_length, bms=True)
-        # TODO：是否替换''
         print(result)
         decoded_words.extend(result)
 
