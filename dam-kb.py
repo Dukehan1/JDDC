@@ -12,7 +12,7 @@ from torch.nn.utils import clip_grad_norm_
 import os
 import pickle
 import math
-from gensim import corpora, models, similarities
+# from gensim import corpora, models, similarities
 
 from dataToOpenNMT import sentence_with_kb, word_tokenizer
 
@@ -43,8 +43,8 @@ def load_stopwords():
 
 
 def init_embedding(embed_size, n_word, word2index):
-    if os.path.exists('model_smn/pretrained'):
-        t = open('model_smn/pretrained', 'rb')
+    if os.path.exists('model_dam/pretrained'):
+        t = open('model_dam/pretrained', 'rb')
         embeddings = pickle.load(t)
         t.close()
     else:
@@ -69,7 +69,7 @@ def init_embedding(embed_size, n_word, word2index):
                 print('out: ', word)
         print("took {:.2f} seconds\n".format(time.time() - start))
 
-        t = open('model_smn/pretrained', 'wb')
+        t = open('model_dam/pretrained', 'wb')
         pickle.dump(embeddings, t)
         t.close()
     return torch.tensor(embeddings, device=device_cpu)
@@ -147,40 +147,56 @@ def indexesFromSentence(lang, sentence):
     return result
 
 
-class SMN(nn.Module):
-    def __init__(self, embed_size, hidden_size, compression_hidden_size, max_num_utterance, max_length,
-                 bidirectional, num_layers, dropout_p):
-        super(SMN, self).__init__()
+class AttentiveModule(nn.Module):
+    def __init__(self, embed_size, max_length):
+        super(AttentiveModule, self).__init__()
         self.embed_size = embed_size
-        self.hidden_size = hidden_size
-        self.compression_hidden_size = compression_hidden_size
+
+        self.norm1 = nn.LayerNorm((max_length, embed_size))
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_size, embed_size),
+            nn.ReLU(),
+            nn.Linear(embed_size, embed_size)
+        )
+        self.norm2 = nn.LayerNorm((max_length, embed_size))
+
+    def forward(self, query, key, value):
+        '''
+        :param query: (b, l, embed)
+        :param key: (b, l, embed)
+        :param value: (b, l, embed)
+        :return:
+        '''
+        att_q_k = torch.softmax(torch.bmm(query, key.transpose(1, 2)) / math.sqrt(self.embed_size), dim=2)  # (b, l, l)
+        v_att = torch.bmm(att_q_k, value)  # (b, l, embed)
+        input = v_att + query  # (b, l, embed)
+        input = self.norm1(input)
+        output = self.ffn(input)
+        result = input + output
+        result = self.norm2(result)
+        return result
+
+
+class DAM(nn.Module):
+    def __init__(self, embed_size, max_num_utterance, max_length, max_stacks):
+        super(DAM, self).__init__()
+        self.embed_size = embed_size
         self.max_num_utterance = max_num_utterance
         self.max_length = max_length
-        self.num_layers = num_layers
-        self.dropout_p = dropout_p
-        self.bidirectional = bidirectional
+        self.max_stacks = max_stacks
 
-        self.dropout = nn.Dropout(self.dropout_p)
-
-        if self.bidirectional:
-            self.sentence_gru = nn.LSTM(embed_size, hidden_size // 2, bidirectional=True, num_layers=num_layers, batch_first=True)
-            self.final_gru = nn.LSTM(compression_hidden_size, compression_hidden_size // 2, bidirectional=True, batch_first=True)
-        else:
-            self.sentence_gru = nn.LSTM(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
-            self.final_gru = nn.LSTM(compression_hidden_size, compression_hidden_size, batch_first=True)
-
-        self.a = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.am = AttentiveModule(self.embed_size, self.max_length)
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=2, out_channels=16, kernel_size=(3, 3)),
-            nn.BatchNorm2d(16),
+            nn.Conv3d(in_channels=max_num_utterance, out_channels=32, kernel_size=(3, 3, 3), stride=(1, 1, 1)),
+            nn.BatchNorm3d(32),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=(3, 3), stride=(3, 3))
+            nn.MaxPool3d(kernel_size=(3, 3, 3), stride=(3, 3, 3)),
+            nn.Conv3d(in_channels=32, out_channels=16, kernel_size=(3, 3, 3), stride=(1, 1, 1)),
+            nn.BatchNorm3d(16),
+            nn.ReLU(),
+            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(3, 3, 3)),
         )
-        self.matching = nn.Sequential(
-            nn.Linear(math.floor(16 * pow((max_length - 5) / 3 + 1, 2)), compression_hidden_size),
-            nn.ReLU()
-        )
-        self.final = nn.Linear(compression_hidden_size, 2)
+        self.final = nn.Linear(256, 2)
 
     def forward(self, utterances, response):
         '''
@@ -190,25 +206,30 @@ class SMN(nn.Module):
         '''
         b = response.size(0)
         utterances = utterances.transpose(0, 1)
-        matching_vectors = []
-        response_output, _ = self.sentence_gru(response)  # (b, l, hidden)
-        response_output = self.dropout(response_output)
+
+        R = [response]
+        for _ in range(self.max_stacks):
+            response = self.am(response, response, response)
+            R.append(response)
+
+        cube = []
+
         for utterance in utterances:
-            M1 = torch.bmm(utterance, response.transpose(1, 2))  # (b, l, l)
+            U = [utterance]
+            for _ in range(self.max_stacks):
+                utterance = self.am(utterance, utterance, utterance)
+                U.append(utterance)
 
-            utterance_output, _ = self.sentence_gru(utterance)  # (b, l, hidden)
-            utterance_output = self.dropout(utterance_output)
-            utterance_output_trans = self.a(utterance_output)  # (b, l, hidden)
-            M2 = torch.bmm(utterance_output_trans, response_output.transpose(1, 2))  # (b, l, l)
+            self_attention = []
+            cross_attention = []
+            for i in range(len(U)):
+                self_attention.append(torch.bmm(U[i], R[i].transpose(1, 2)))
+                cross_attention.append(torch.bmm(self.am(U[i], R[i], R[i]), self.am(R[i], U[i], U[i]).transpose(1, 2)))
+            cube.append(torch.stack(self_attention + cross_attention, 1))
 
-            matching_vector = torch.stack([M1, M2], 1)  # (b, 2, l, l)
-            matching_vector = self.conv(matching_vector)
-            matching_vector = self.matching(matching_vector.view(b, -1))  # (b, 50)
-            matching_vectors.append(matching_vector.view(b, -1))
-        matching_vectors = torch.stack(matching_vectors, 1)  # (b, max_num_utterance, 50)
-        _, (hidden, _) = self.final_gru(matching_vectors)  # (1, b, 50)
-        hidden = hidden.transpose(0, 1).reshape(b, -1)
-        output = F.log_softmax(self.final(hidden), dim=1)  # (b, 2)
+        cube = torch.stack(cube, 1)  # (b, max_num_utterance, 2 * (max_stacks + 1), max_length, max_length)
+        v = self.conv(cube)
+        output = F.log_softmax(self.final(v.view(b, -1)), dim=1)  # (b, 2)
         return output
 
 
@@ -266,35 +287,35 @@ def ComputeR10_1(scores, labels, count=10):
     return float(correct) / total
 
 
-def train(utterances, response, label, embedding, smn, optimizer, criterion):
+def train(utterances, response, label, embedding, dam, optimizer, criterion):
     # Training mode (enable dropout)
-    smn.train()
+    dam.train()
     optimizer.zero_grad()
 
     utterances = embedding(utterances)
     response = embedding(response)
-    output = smn(utterances, response)
+    output = dam(utterances, response)
     loss = criterion(output, label)
 
     loss.backward()
     # print(list(map(lambda x: x.grad, embedding.parameters())))
-    # print(list(map(lambda x: x.grad, smn.parameters())))
+    # print(list(map(lambda x: x.grad, dam.parameters())))
     clip_grad_norm_(embedding.parameters(), 2)
-    clip_grad_norm_(smn.parameters(), 2)
+    clip_grad_norm_(dam.parameters(), 2)
 
     optimizer.step()
 
     return loss.data.item()
 
 
-def inference(utterances, response, embedding, smn):
+def inference(utterances, response, embedding, dam):
     with torch.no_grad():
         # Inference mode (disable dropout)
-        smn.eval()
+        dam.eval()
 
         utterances = embedding(utterances)
         response = embedding(response)
-        output = smn(utterances, response)
+        output = dam(utterances, response)
         output = output[:, 1]
         output = output.data.cpu().numpy()
 
@@ -310,7 +331,7 @@ def flat(l):
 '''
 
 
-def trainIters(vocab, embedding, smn, optimizer, train_examples, dev_examples, n_iters, learning_rate, batch_size,
+def trainIters(vocab, embedding, dam, optimizer, train_examples, dev_examples, n_iters, learning_rate, batch_size,
                infer_batch_size, print_every=1000, plot_every=100):
     plot_losses = []
     print_loss_total = 0  # Reset every print_every
@@ -320,14 +341,14 @@ def trainIters(vocab, embedding, smn, optimizer, train_examples, dev_examples, n
 
     # 在有Model时预先生成best_score
     print("============evaluate_start==================")
-    score = evaluate(embedding, smn, dev_examples, infer_batch_size)
+    score = evaluate(embedding, dam, dev_examples, infer_batch_size)
     print('R10@1_socre: {0}'.format(score))
     if score >= best_score:
         best_score = score
-        torch.save(smn.state_dict(), 'model_smn/smn')
-        torch.save(embedding.state_dict(), 'model_smn/embedding')
-        torch.save(optimizer.state_dict(), 'model_smn/optimizer')
-        print('new model_smn saved.')
+        torch.save(dam.state_dict(), 'model_dam/dam')
+        torch.save(embedding.state_dict(), 'model_dam/embedding')
+        torch.save(optimizer.state_dict(), 'model_dam/optimizer')
+        print('new model_dam saved.')
     print("==============evaluate_end==================")
 
     for iter in range(1, n_iters + 1):
@@ -345,7 +366,7 @@ def trainIters(vocab, embedding, smn, optimizer, train_examples, dev_examples, n
             response = torch.tensor(response + neg_response, dtype=torch.long, device=device_cuda)
             label = torch.tensor(label + [0] * len(label), dtype=torch.long, device=device_cuda)
 
-            loss = train(utterances, response, label, embedding, smn, optimizer, criterion)
+            loss = train(utterances, response, label, embedding, dam, optimizer, criterion)
 
             print_loss_total += loss
             plot_loss_total += loss
@@ -361,18 +382,18 @@ def trainIters(vocab, embedding, smn, optimizer, train_examples, dev_examples, n
             plot_loss_total = 0
 
         print("============evaluate_start==================")
-        score = evaluate(embedding, smn, dev_examples, infer_batch_size)
+        score = evaluate(embedding, dam, dev_examples, infer_batch_size)
         print('R10@1_socre: {0}'.format(score))
         if score >= best_score:
             best_score = score
-            torch.save(smn.state_dict(), 'model_smn/smn')
-            torch.save(embedding.state_dict(), 'model_smn/embedding')
-            torch.save(optimizer.state_dict(), 'model_smn/optimizer')
-            print('new model_smn saved.')
+            torch.save(dam.state_dict(), 'model_dam/dam')
+            torch.save(embedding.state_dict(), 'model_dam/embedding')
+            torch.save(optimizer.state_dict(), 'model_dam/optimizer')
+            print('new model_dam saved.')
         print("==============evaluate_end==================")
 
 
-def evaluate(embedding, smn, dev_examples, infer_batch_size):
+def evaluate(embedding, dam, dev_examples, infer_batch_size):
     predict = []
     for i in range(0, len(dev_examples[0]), infer_batch_size):
         # print("batch: ", int(i / infer_batch_size))
@@ -382,7 +403,7 @@ def evaluate(embedding, smn, dev_examples, infer_batch_size):
         utterances = torch.tensor(utterances, dtype=torch.long, device=device_cuda)
         response = torch.tensor(response, dtype=torch.long, device=device_cuda)
 
-        predict.extend(inference(utterances, response, embedding, smn))
+        predict.extend(inference(utterances, response, embedding, dam))
 
     score = ComputeR10_1(predict, dev_examples[2])
     return score
@@ -390,17 +411,13 @@ def evaluate(embedding, smn, dev_examples, infer_batch_size):
 
 max_length = 50
 max_num_utterance = 6
+max_stacks = 5
 
 n_epochs = 20
 lr = 0.001
-batch_size = 100
-infer_batch_size = 5000
+batch_size = 64
+infer_batch_size = 1000
 embed_size = 300
-hidden_size = 200
-compression_hidden_size = 50
-bidirectional = True
-dropout_p = 0.3
-num_layers = 3
 cut = 8
 
 K = 15
@@ -483,21 +500,19 @@ def run_train():
         map(lambda x: x.split(' '), open('opennmt-kb/val.txt.src', encoding="utf-8").read().strip().split('\n')))
 
     # for debug
-    '''
     data['trainAnswers'] = data['trainAnswers'][:5]
     data['trainQuestions'] = data['trainQuestions'][:5]
     data['devAnswers'] = [list(x) for x in data['trainAnswers']]
     data['devQuestions'] = [list(x) for x in data['trainQuestions']]
-    '''
 
     # 生成词表（word）
-    if os.path.exists('model_smn/vocab_word'):
-        t = open('model_smn/vocab_word', 'rb')
+    if os.path.exists('model_dam/vocab_word'):
+        t = open('model_dam/vocab_word', 'rb')
         vocab_word = pickle.load(t)
         t.close()
     else:
         vocab_word = prepare_vocabulary(data, cut=cut)
-        t = open('model_smn/vocab_word', 'wb')
+        t = open('model_dam/vocab_word', 'wb')
         pickle.dump(vocab_word, t)
         t.close()
     print("========================word===========================")
@@ -506,14 +521,14 @@ def run_train():
     print('max_word_length: ', max(map(lambda x: len(x), vocab_word.word2index)))
 
     # 生成数据（截断，生成负例）
-    if os.path.exists('model_smn/data'):
-        t = open('model_smn/data', 'rb')
+    if os.path.exists('model_dam/data'):
+        t = open('model_dam/data', 'rb')
         train_examples, dev_examples = pickle.load(t)
         t.close()
     else:
         train_examples = gen_data(vocab_word, data['trainQuestions'], data['trainAnswers'], 1)
         dev_examples = gen_data(vocab_word, data['devQuestions'], data['devAnswers'], 10)
-        t = open('model_smn/data', 'wb')
+        t = open('model_dam/data', 'wb')
         pickle.dump((train_examples, dev_examples), t)
         t.close()
     print("========================dataset===========================")
@@ -522,98 +537,24 @@ def run_train():
 
     embed = init_embedding(embed_size, vocab_word.n_words, vocab_word.word2index)
     embedding = nn.Embedding(vocab_word.n_words, embed_size, padding_idx=0).from_pretrained(embed, freeze=False)
-    smn = SMN(embed_size, hidden_size, compression_hidden_size, max_num_utterance, max_length,
-              bidirectional=bidirectional, num_layers=num_layers, dropout_p=dropout_p)
+    dam = DAM(embed_size, max_num_utterance, max_length, max_stacks)
 
     embedding = torch.nn.DataParallel(embedding).to(device_cuda)
-    smn = torch.nn.DataParallel(smn).to(device_cuda)
+    dam = torch.nn.DataParallel(dam).to(device_cuda)
 
-    if os.path.isfile('model_smn/embedding'):
-        embedding.load_state_dict(torch.load('model_smn/embedding'))
+    if os.path.isfile('model_dam/embedding'):
+        embedding.load_state_dict(torch.load('model_dam/embedding'))
 
-    if os.path.isfile('model_smn/smn'):
-        smn.load_state_dict(torch.load('model_smn/smn'))
+    if os.path.isfile('model_dam/dam'):
+        dam.load_state_dict(torch.load('model_dam/dam'))
 
-    optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": smn.parameters()}], lr=lr, amsgrad=True)
+    optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": dam.parameters()}], lr=lr, amsgrad=True)
 
-    if os.path.isfile('model_smn/optimizer'):
-        optimizer.load_state_dict(torch.load('model_smn/optimizer'))
+    if os.path.isfile('model_dam/optimizer'):
+        optimizer.load_state_dict(torch.load('model_dam/optimizer'))
 
-    trainIters(vocab_word, embedding, smn, optimizer, train_examples, dev_examples, n_epochs, lr, batch_size,
+    trainIters(vocab_word, embedding, dam, optimizer, train_examples, dev_examples, n_epochs, lr, batch_size,
                infer_batch_size, print_every=1)
-
-
-def run_prediction(input_file_path, output_file_path):
-
-    # 生成词表（word）
-    t = open('model_smn/vocab_word', 'rb')
-    vocab_word = pickle.load(t)
-    t.close()
-    print("========================word===========================")
-    print('dec_vocab_size: ', vocab_word.n_words_for_decoder)
-    print('vocab_size: ', vocab_word.n_words)
-    print('max_word_length: ', max(map(lambda x: len(x), vocab_word.word2index)))
-
-    # smn
-    embedding = nn.Embedding(vocab_word.n_words, embed_size, padding_idx=0)
-    smn = SMN(embed_size, hidden_size, compression_hidden_size, max_num_utterance, max_length,
-              bidirectional=bidirectional, num_layers=num_layers, dropout_p=dropout_p)
-
-    embedding = torch.nn.DataParallel(embedding).to(device_cuda)
-    smn = torch.nn.DataParallel(smn).to(device_cuda)
-
-    embedding.load_state_dict(torch.load('model_smn/embedding', map_location='cpu'))
-    smn.load_state_dict(torch.load('model_smn/smn', map_location='cpu'))
-
-    # tfidf
-    trainAnswers = list(map(lambda x: x.split(' '),
-                            open('opennmt-kb/train.txt.tgt', encoding="utf-8").read().strip().split('\n'))) + \
-                   list(map(lambda x: x.split(' '),
-                            open('opennmt-kb/val.txt.tgt', encoding="utf-8").read().strip().split('\n')))
-
-    dictionary = corpora.Dictionary.load('model_tfidf/dictionary.dict')
-    model = models.TfidfModel.load('model_tfidf/tfidf.model')
-    index = similarities.Similarity.load('model_tfidf/similarity.index')
-
-    input_data = open(input_file_path, encoding="utf-8").read().strip().split('\n')
-
-    input_data_with_kb = list(map(lambda x: sentence_with_kb(x), input_data))
-    input_data_with_kb = list(map(lambda x: word_tokenizer(x), input_data_with_kb))
-
-    input_data_without_kb = list(map(lambda x: word_tokenizer(x), input_data))
-
-    stopwords = load_stopwords()
-    pred = []
-    for i in range(len(input_data)):
-        # 生成候选集
-        input_query = input_data_without_kb[i]
-        result = []
-        for word in input_query:
-            if word in stopwords:
-                continue
-            result.append(word)
-        input_query = result
-        vec_bow = dictionary.doc2bow(input_query)
-        sentence_vec = model[vec_bow]
-        sims = index[sentence_vec]
-        answer_index = max(list(enumerate(sims)), key=lambda item: item[1])[:K]
-
-        # rerank
-        candidate_utterances = [input_data_with_kb] * K
-        candidate_response = [trainAnswers[t] for t in answer_index]
-        print(candidate_utterances)
-        print(candidate_response)
-        examples = gen_data(vocab_word, candidate_utterances, candidate_response, 1)
-        utterances = torch.tensor(examples[0], dtype=torch.long, device=device_cuda)
-        response = torch.tensor(examples[1], dtype=torch.long, device=device_cuda)
-        probs = inference(utterances, response, embedding, smn)
-        print(probs)
-        pred_query = candidate_response[np.argmax(probs)]
-        pred_query = [word if word != '' else ' ' for word in pred_query]
-        print(pred_query)
-        pred.append(''.join(pred_query))
-    output_file = open(output_file_path, 'w', encoding='utf-8')
-    output_file.write('\n'.join(pred))
 
 
 if __name__ == "__main__":

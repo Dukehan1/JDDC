@@ -64,7 +64,7 @@ def init_embedding(embed_size, n_word, word2index):
 class Lang:
     def __init__(self, name):
         self.name = name
-        self.word2index = {}
+        self.word2index = {"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3}
         self.word2count = {}
         self.index2word = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
         self.n_words = 4  # Count PAD, UNK, SOS and EOS
@@ -501,18 +501,6 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
     for iter in range(1, n_iters + 1):
         print("======================iter%s============================" % iter)
         for i, training_batch in enumerate(get_minibatches(train_pairs, batch_size)):
-            if i % 10000 == 0 and i != 0:
-                print("============evaluate_start==================")
-                bleu_score = evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_batch_size)
-                print('bleu_socre: {0}'.format(bleu_score))
-                if bleu_score >= best_bleu_score:
-                    best_bleu_score = bleu_score
-                    torch.save(encoder.state_dict(), 'model_copynet/encoder')
-                    torch.save(decoder.state_dict(), 'model_copynet/decoder')
-                    torch.save(embedding.state_dict(), 'model_copynet/embedding')
-                    torch.save(optimizer.state_dict(), 'model_copynet/optimizer')
-                    print('new model_copynet saved.')
-                print("==============evaluate_end==================")
 
             # print("batch: ", i)
             # 排序并padding
@@ -594,20 +582,55 @@ def evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_bat
     return bleu_score
 
 # 实际的序列会多一个终止token
-ENC_MAX_LEN = 800
+max_seq_length = 150
+max_num_utterance = 8
 DEC_MAX_LEN = 150
 max_length = DEC_MAX_LEN + 1
 
 n_epochs = 40
 lr = 0.001
-batch_size = 32
+batch_size = 16
 infer_batch_size = 512
 embed_size = 300
 hidden_size = 256
 bidirectional = True
-dropout_p = 0.3
-num_layers = 3
+dropout_p = 0.5
+num_layers = 2
 cut = 8
+
+
+def cut_utterances(chunk):
+    '''
+    裁剪并填充utterances
+    '''
+    utterances = []
+    temp = []
+    j = 0
+    chunk.reverse()
+    for w in chunk:
+        if w == '<s>':
+            j += 1
+        if j < 6:
+            temp.insert(0, w)
+        else:
+            if w == '<s>':
+                utterances.append(temp)
+                temp = []
+            else:
+                temp.insert(0, w)
+    utterances.append(temp)
+    utterances = utterances[:max_num_utterance]
+    temp = utterances[1:]
+    temp.reverse()
+    utterances = utterances[:1] + temp
+    utterances = utterances + (max_num_utterance - len(utterances)) * [[]]
+    utterances = list(map(lambda x: x[:max_length], utterances))
+    utterances = list(map(lambda x: x + (max_length - len(x)) * ['<PAD>'], utterances))
+    result = []
+    for u in utterances:
+        result.extend(u)
+    return result
+
 
 def run_train():
     data = {
@@ -649,28 +672,24 @@ def run_train():
     print('max_word_length: ', max(map(lambda x: len(x), vocab_word.word2index)))
 
     # 生成数据（截断）
-    train_pairs = []
-    dev_pairs = []
-    for i in range(len(data['trainQuestions'])):
-        if len(data['trainQuestions'][i]) > ENC_MAX_LEN:
-            data['trainQuestions'][i] = data['trainQuestions'][i][-ENC_MAX_LEN:]
-            # print(data['trainQuestions'][i])
-            # print(len(data['trainQuestions'][i]))
-        if len(data['trainAnswers'][i]) > DEC_MAX_LEN:
+    if os.path.exists('model_copynet/data'):
+        t = open('model_copynet/data', 'rb')
+        train_pairs, dev_pairs = pickle.load(t)
+        t.close()
+    else:
+        train_pairs = []
+        dev_pairs = []
+        for i in range(len(data['trainQuestions'])):
+            data['trainQuestions'][i] = cut_utterances(data['trainQuestions'][i])
             data['trainAnswers'][i] = data['trainAnswers'][i][:DEC_MAX_LEN]
-            # print(data['trainAnswers'][i])
-            # print(len(data['trainAnswers'][i]))
-        train_pairs.append((data['trainQuestions'][i], data['trainAnswers'][i]))
-    for i in range(len(data['devQuestions'])):
-        if len(data['devQuestions'][i]) > ENC_MAX_LEN:
-            data['devQuestions'][i] = data['devQuestions'][i][-ENC_MAX_LEN:]
-            # print(data['devQuestions'][i])
-            # print(len(data['devQuestions'][i]))
-        if len(data['devAnswers'][i]) > DEC_MAX_LEN:
+            train_pairs.append((data['trainQuestions'][i], data['trainAnswers'][i]))
+        for i in range(len(data['devQuestions'])):
+            data['devQuestions'][i] = cut_utterances(data['devQuestions'][i])
             data['devAnswers'][i] = data['devAnswers'][i][:DEC_MAX_LEN]
-            # print(data['devAnswers'][i])
-            # print(len(data['devAnswers'][i]))
-        dev_pairs.append((data['devQuestions'][i], data['devAnswers'][i]))
+            dev_pairs.append((data['devQuestions'][i], data['devAnswers'][i]))
+        t = open('model_copynet/data', 'wb')
+        pickle.dump((train_pairs, dev_pairs), t)
+        t.close()
 
     # 共用一套embedding
     embed = init_embedding(embed_size, vocab_word.n_words, vocab_word.word2index)
