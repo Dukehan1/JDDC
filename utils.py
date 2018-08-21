@@ -88,7 +88,7 @@ class Lang:
         self.n_words_for_decoder = self.n_words
 
 
-def prepare_vocabulary(data, cut=3):
+def prepare_vocabulary(data, cut=8):
     # 生成词表，前半部分仅供decoder使用，整体供encoder使用
     lang = Lang('zh-cn')
     # 仅使用训练集统计
@@ -384,6 +384,9 @@ def sentence_with_kb(sentence):
                 sku_2s = []
                 for term in order[order_id]:
                     order_1 = '<ORDER_1_' + term[4] + '>'
+                    if term[1] in user:
+                        user_1 = '<USER_1_' + user[term[1]][1] + '>'
+                        user_2 = '<USER_2_' + user[term[1]][3] + '>'
                     sku_1s.append(sku[term[2]][1])
                     sku_2s.append(sku[term[2]][2])
                 sku_1 = '|'.join(sku_1s)

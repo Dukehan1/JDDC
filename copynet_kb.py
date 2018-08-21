@@ -562,7 +562,7 @@ def run_prediction(input_file_path, output_file_path):
         enc = [s]
         enc = torch.tensor(enc, dtype=torch.long, device=device_cuda)
         enc_lens = [len(s)]
-        result = inference(vocab_word, enc, enc_lens, embedding, encoder, attn_decoder, max_length, bms=True)
+        result = inference(vocab_word, enc, enc_lens, embedding, encoder, attn_decoder, max_length, bms=False)
         print(result)
         decoded_words.extend(result)
 
@@ -574,3 +574,4 @@ def run_prediction(input_file_path, output_file_path):
 
 if __name__ == "__main__":
     run_train()
+    # run_prediction('../questions50.txt', 'result.txt')
