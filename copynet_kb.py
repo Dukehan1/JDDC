@@ -2,7 +2,6 @@
 import numpy as np
 import re
 import random
-import time
 import torch
 import torch.nn as nn
 from torch import optim
@@ -11,133 +10,9 @@ from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from torch.nn.utils import clip_grad_norm_
 import os
 import pickle
-from nltk.translate.bleu_score import sentence_bleu
-from nltk.translate.bleu_score import SmoothingFunction
 
-from dataToOpenNMT import word_tokenizer, sentence_with_kb
-
-device_cuda = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device_cpu = torch.device("cpu")
-
-PAD_token = 0
-UNK_token = 1
-SOS_token = 2
-EOS_token = 3
-
-
-VECTOR_DIR = 'embed/sgns.merge.word'
-
-
-def init_embedding(embed_size, n_word, word2index):
-    if os.path.exists('model_copynet/pretrained'):
-        t = open('model_copynet/pretrained', 'rb')
-        embeddings = pickle.load(t)
-        t.close()
-    else:
-        print("Loading pretrained embeddings...")
-        start = time.time()
-
-        def get_coefs(word, *arr):
-            return word, np.asarray(arr, dtype=np.float32)
-
-        embeddings_dict = dict(get_coefs(*o.rstrip().rsplit(' ')) for o in open(VECTOR_DIR, encoding='utf-8') if
-                               len(o.rstrip().rsplit(' ')) != 2)
-        print(len(embeddings_dict))
-
-        # print 'no pretrained: '
-        embeddings = np.random.randn(n_word, embed_size).astype(np.float32)
-        for word, i in word2index.items():
-            embedding_vector = embeddings_dict.get(word)
-            if embedding_vector is not None:
-                embeddings[i] = embedding_vector
-                print('in: ', word)
-            else:
-                print('out: ', word)
-        print("took {:.2f} seconds\n".format(time.time() - start))
-
-        t = open('model_copynet/pretrained', 'wb')
-        pickle.dump(embeddings, t)
-        t.close()
-    return torch.tensor(embeddings, device=device_cpu)
-
-
-class Lang:
-    def __init__(self, name):
-        self.name = name
-        self.word2index = {"<PAD>": 0, "<UNK>": 1, "<SOS>": 2, "<EOS>": 3}
-        self.word2count = {}
-        self.index2word = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
-        self.n_words = 4  # Count PAD, UNK, SOS and EOS
-        self.n_words_for_decoder = self.n_words
-
-    def addSentence(self, sentence):
-        for word in sentence:
-            self.addWord(word)
-
-    def addWord(self, word):
-        if word not in self.word2index:
-            self.word2index[word] = self.n_words
-            self.word2count[word] = 1
-            self.index2word.append(word)
-            self.n_words += 1
-        else:
-            self.word2count[word] += 1
-
-    def updateDecoderWords(self):
-        # 记录Decoder词表的大小
-        self.n_words_for_decoder = self.n_words
-
-
-def prepare_vocabulary(data, cut=3):
-    # 生成词表，前半部分仅供decoder使用，整体供encoder使用
-    lang = Lang('zh-cn')
-    # 仅使用训练集统计
-    data = {
-        'trainAnswers': data['trainAnswers'],
-        'trainQuestions': data['trainQuestions']
-    }
-    for f in data:
-        lines = data[f]
-        for line in lines:
-            lang.addSentence(line)
-        # 记录Decoder词表的大小
-        if f == 'trainAnswers':
-            lang.updateDecoderWords()
-
-    # 削减词汇表
-    dec = []
-    rest = []
-    for k, v in enumerate(lang.index2word):
-        if v in lang.word2count:
-            if k < lang.n_words_for_decoder:
-                dec.append((v, lang.word2count[v]))
-            else:
-                rest.append((v, lang.word2count[v]))
-    dec = list(filter(lambda x: x[1] > cut, dec))
-    rest = list(filter(lambda x: x[1] > cut, rest))
-    lang.n_words_for_decoder = 4 + len(dec)
-    lang.n_words = 4 + len(dec) + len(rest)
-    lang.word2index = {}
-    lang.word2count = {}
-    lang.index2word = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
-    for i in dec + rest:
-        lang.word2index[i[0]] = len(lang.index2word)
-        lang.word2count[i[0]] = i[1]
-        lang.index2word.append(i[0])
-
-    return lang
-
-
-def indexesFromSentence(lang, sentence):
-    result = [lang.word2index[word] if word in lang.word2index else UNK_token for word in sentence]
-    result.append(EOS_token)
-    return result
-
-
-def indexesFromPair(lang, pair):
-    input = indexesFromSentence(lang, pair[0])
-    target = indexesFromSentence(lang, pair[1])
-    return input, target
+from utils import word_tokenizer, sentence_with_kb, SOS_token, EOS_token, device_cuda, get_minibatches, indexesFromPair, \
+    bleu, init_embedding, cut_utterances, prepare_vocabulary, indexesFromSentenceInSeq
 
 
 class EncoderRNN(nn.Module):
@@ -251,43 +126,6 @@ class CopynetDecoderRNN(nn.Module):
         return output, cur_hidden, cur_attention
 
 
-def get_minibatches(data, minibatch_size, shuffle=True):
-    """
-    Iterates through the provided data one minibatch at at time. You can use this function to
-    iterate through data in minibatches as follows:
-        for inputs_minibatch in get_minibatches(inputs, minibatch_size):
-            ...
-    Or with multiple data sources:
-        for inputs_minibatch, labels_minibatch in get_minibatches([inputs, labels], minibatch_size):
-            ...
-    Args:
-        data: there are two possible values:
-            - a list or numpy array
-            - a list where each element is either a list or numpy array
-        minibatch_size: the maximum number of items in a minibatch
-        shuffle: whether to randomize the order of returned data
-    Returns:
-        minibatches: the return value depends on data:
-            - If data is a list/array it yields the next minibatch of data.
-            - If data a list of lists/arrays it returns the next minibatch of each element in the
-              list. This can be used to iterate through multiple data sources
-              (e.g., features and labels) at the same time.
-    """
-    list_data = type(data) is list and (type(data[0]) is list or type(data[0]) is np.ndarray)
-    data_size = len(data[0]) if list_data else len(data)
-    indices = np.arange(data_size)
-    if shuffle:
-        np.random.shuffle(indices)
-    for minibatch_start in np.arange(0, data_size, minibatch_size):
-        minibatch_indices = indices[minibatch_start:minibatch_start + minibatch_size]
-        yield [minibatch(d, minibatch_indices) for d in data] if list_data \
-            else minibatch(data, minibatch_indices)
-
-
-def minibatch(data, minibatch_idx):
-    return data[minibatch_idx] if type(data) is np.ndarray else [data[i] for i in minibatch_idx]
-
-
 class Node(object):
     def __init__(self, decoder_input_id, decoder_input, decoder_hidden, decoder_attention, parent, cost):
         super(Node, self).__init__()
@@ -367,7 +205,7 @@ def beam_search(embedding, decoder, decoder_input_id, decoder_input, encoder_out
             for y_t_n, y_nll_t_n in zip(Y_t_n.squeeze(), Y_nll_t_n.squeeze()):
                 n_new = Node(y_t_n.view(1, 1), embedding(y_t_n.view(1, 1)), decoder_hidden_t_n, decoder_attention_t_n, n, y_nll_t_n.item())
                 next_fringe.append(n_new)
-        next_fringe = sorted(next_fringe, key=lambda x: x.cost)[:beam_width]
+        next_fringe = sorted(next_fringe, key=lambda x: x.cum_cost)[:beam_width]
 
     if not hypotheses:
         hypotheses = next_fringe
@@ -376,20 +214,6 @@ def beam_search(embedding, decoder, decoder_input_id, decoder_input, encoder_out
 
 
 teacher_forcing_ratio = 1.0
-
-
-def bleu(gold, predict):
-    chencherry = SmoothingFunction()
-    score = []
-    for i in range(len(gold)):
-        bleuScore = sentence_bleu([list(gold[i])], list(predict[i]), weights=(0.25, 0.25, 0.25, 0.25),
-                                  smoothing_function=chencherry.method1)
-        score.append(bleuScore)
-    # 最终得分
-    scoreFinal = sum(score) / float(len(score))
-    # 最终得分精确到小数点后6位
-    precisionScore = round(scoreFinal, 6)
-    return precisionScore
 
 
 def train(input, input_lens, target, target_lens, embedding, encoder, decoder, optimizer, criterion):
@@ -491,11 +315,11 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
     print('bleu_socre: {0}'.format(bleu_score))
     if bleu_score >= best_bleu_score:
         best_bleu_score = bleu_score
-        torch.save(encoder.state_dict(), 'model_copynet/encoder')
-        torch.save(decoder.state_dict(), 'model_copynet/decoder')
-        torch.save(embedding.state_dict(), 'model_copynet/embedding')
-        torch.save(optimizer.state_dict(), 'model_copynet/optimizer')
-        print('new model_copynet saved.')
+        torch.save(encoder.state_dict(), model_dir + '/encoder')
+        torch.save(decoder.state_dict(), model_dir + '/decoder')
+        torch.save(embedding.state_dict(), model_dir + '/embedding')
+        torch.save(optimizer.state_dict(), model_dir + '/optimizer')
+        print('new ' + model_dir + ' saved.')
     print("==============evaluate_end==================")
 
     for iter in range(1, n_iters + 1):
@@ -540,11 +364,11 @@ def trainIters(lang, embedding, encoder, decoder, optimizer, train_pairs, dev_pa
         print('bleu_socre: {0}'.format(bleu_score))
         if bleu_score >= best_bleu_score:
             best_bleu_score = bleu_score
-            torch.save(encoder.state_dict(), 'model_copynet/encoder')
-            torch.save(decoder.state_dict(), 'model_copynet/decoder')
-            torch.save(embedding.state_dict(), 'model_copynet/embedding')
-            torch.save(optimizer.state_dict(), 'model_copynet/optimizer')
-            print('new model_copynet saved.')
+            torch.save(encoder.state_dict(), model_dir + '/encoder')
+            torch.save(decoder.state_dict(), model_dir + '/decoder')
+            torch.save(embedding.state_dict(), model_dir + '/embedding')
+            torch.save(optimizer.state_dict(), model_dir + '/optimizer')
+            print('new ' + model_dir + ' saved.')
         print("==============evaluate_end==================")
 
 
@@ -582,8 +406,8 @@ def evaluate(lang, embedding, encoder, decoder, dev_pairs, max_length, infer_bat
     return bleu_score
 
 # 实际的序列会多一个终止token
-max_seq_length = 150
-max_num_utterance = 8
+max_seq_length = 200
+max_num_utterance = 6
 DEC_MAX_LEN = 150
 max_length = DEC_MAX_LEN + 1
 
@@ -598,38 +422,8 @@ dropout_p = 0.5
 num_layers = 2
 cut = 8
 
-
-def cut_utterances(chunk):
-    '''
-    裁剪并填充utterances
-    '''
-    utterances = []
-    temp = []
-    j = 0
-    chunk.reverse()
-    for w in chunk:
-        if w == '<s>':
-            j += 1
-        if j < 6:
-            temp.insert(0, w)
-        else:
-            if w == '<s>':
-                utterances.append(temp)
-                temp = []
-            else:
-                temp.insert(0, w)
-    utterances.append(temp)
-    utterances = utterances[:max_num_utterance]
-    temp = utterances[1:]
-    temp.reverse()
-    utterances = utterances[:1] + temp
-    utterances = utterances + (max_num_utterance - len(utterances)) * [[]]
-    utterances = list(map(lambda x: x[:max_length], utterances))
-    utterances = list(map(lambda x: x + (max_length - len(x)) * ['<PAD>'], utterances))
-    result = []
-    for u in utterances:
-        result.extend(u)
-    return result
+dev_id = 0
+model_dir = 'copynet-kb-model-' + str(dev_id)
 
 
 def run_train():
@@ -640,13 +434,13 @@ def run_train():
         'devQuestions': []
     }
     data['trainAnswers'].extend(
-        map(lambda x: x.split(' '), open('opennmt-kb/train.txt.tgt', encoding="utf-8").read().strip().split('\n')))
+        map(lambda x: x.split(' '), open('opennmt-kb-' + str(dev_id) + '/train.txt.tgt', encoding="utf-8").read().strip().split('\n')))
     data['trainQuestions'].extend(
-        map(lambda x: x.split(' '), open('opennmt-kb/train.txt.src', encoding="utf-8").read().strip().split('\n')))
+        map(lambda x: x.split(' '), open('opennmt-kb-' + str(dev_id) + '/train.txt.src', encoding="utf-8").read().strip().split('\n')))
     data['devAnswers'].extend(
-        map(lambda x: x.split(' '), open('opennmt-kb/val.txt.tgt', encoding="utf-8").read().strip().split('\n')))
+        map(lambda x: x.split(' '), open('opennmt-kb-' + str(dev_id) + '/val.txt.tgt', encoding="utf-8").read().strip().split('\n')))
     data['devQuestions'].extend(
-        map(lambda x: x.split(' '), open('opennmt-kb/val.txt.src', encoding="utf-8").read().strip().split('\n')))
+        map(lambda x: x.split(' '), open('opennmt-kb-' + str(dev_id) + '/val.txt.src', encoding="utf-8").read().strip().split('\n')))
 
     # for debug
     '''
@@ -657,13 +451,13 @@ def run_train():
     '''
 
     # 生成词表（word）
-    if os.path.exists('model_copynet/vocab_word'):
-        t = open('model_copynet/vocab_word', 'rb')
+    if os.path.exists(model_dir + '/vocab_word'):
+        t = open(model_dir + '/vocab_word', 'rb')
         vocab_word = pickle.load(t)
         t.close()
     else:
         vocab_word = prepare_vocabulary(data, cut=cut)
-        t = open('model_copynet/vocab_word', 'wb')
+        t = open(model_dir + '/vocab_word', 'wb')
         pickle.dump(vocab_word, t)
         t.close()
     print("========================word===========================")
@@ -672,24 +466,31 @@ def run_train():
     print('max_word_length: ', max(map(lambda x: len(x), vocab_word.word2index)))
 
     # 生成数据（截断）
-    if os.path.exists('model_copynet/data'):
-        t = open('model_copynet/data', 'rb')
+    if os.path.exists(model_dir + '/data'):
+        t = open(model_dir + '/data', 'rb')
         train_pairs, dev_pairs = pickle.load(t)
         t.close()
     else:
         train_pairs = []
         dev_pairs = []
         for i in range(len(data['trainQuestions'])):
-            data['trainQuestions'][i] = cut_utterances(data['trainQuestions'][i])
+            data['trainQuestions'][i] = cut_utterances(data['trainQuestions'][i], max_num_utterance, max_seq_length)
             data['trainAnswers'][i] = data['trainAnswers'][i][:DEC_MAX_LEN]
             train_pairs.append((data['trainQuestions'][i], data['trainAnswers'][i]))
         for i in range(len(data['devQuestions'])):
-            data['devQuestions'][i] = cut_utterances(data['devQuestions'][i])
+            data['devQuestions'][i] = cut_utterances(data['devQuestions'][i], max_num_utterance, max_seq_length)
             data['devAnswers'][i] = data['devAnswers'][i][:DEC_MAX_LEN]
             dev_pairs.append((data['devQuestions'][i], data['devAnswers'][i]))
-        t = open('model_copynet/data', 'wb')
+        t = open(model_dir + '/data', 'wb')
         pickle.dump((train_pairs, dev_pairs), t)
         t.close()
+    print(train_pairs[0])
+    print(train_pairs[1])
+    print(dev_pairs[0])
+    print(dev_pairs[1])
+    print("========================dataset===========================")
+    print('train: ', len(train_pairs))
+    print('dev: ', len(dev_pairs))
 
     # 共用一套embedding
     embed = init_embedding(embed_size, vocab_word.n_words, vocab_word.word2index)
@@ -703,18 +504,18 @@ def run_train():
     encoder = torch.nn.DataParallel(encoder).to(device_cuda)
     attn_decoder = torch.nn.DataParallel(attn_decoder).to(device_cuda)
 
-    if os.path.isfile('model_copynet/embedding'):
-        embedding.load_state_dict(torch.load('model_copynet/embedding'))
+    if os.path.isfile(model_dir + '/embedding'):
+        embedding.load_state_dict(torch.load(model_dir + '/embedding'))
 
-    if os.path.isfile('model_copynet/encoder') and os.path.isfile('model_copynet/decoder'):
-        encoder.load_state_dict(torch.load('model_copynet/encoder'))
-        attn_decoder.load_state_dict(torch.load('model_copynet/decoder'))
+    if os.path.isfile(model_dir + '/encoder') and os.path.isfile(model_dir + '/decoder'):
+        encoder.load_state_dict(torch.load(model_dir + '/encoder'))
+        attn_decoder.load_state_dict(torch.load(model_dir + '/decoder'))
 
     optimizer = optim.Adam([{"params": embedding.parameters()}, {"params": encoder.parameters()},
                             {"params": attn_decoder.parameters()}], lr=lr, amsgrad=True)
 
-    if os.path.isfile('model_copynet/optimizer'):
-        optimizer.load_state_dict(torch.load('model_copynet/optimizer'))
+    if os.path.isfile(model_dir + '/optimizer'):
+        optimizer.load_state_dict(torch.load(model_dir + '/optimizer'))
 
     trainIters(vocab_word, embedding, encoder, attn_decoder, optimizer, train_pairs, dev_pairs, max_length, n_epochs, lr,
                batch_size, infer_batch_size, print_every=1)
@@ -722,7 +523,7 @@ def run_train():
 
 def run_prediction(input_file_path, output_file_path):
     # 生成词表（word）
-    t = open('model_copynet/vocab_word', 'rb')
+    t = open(model_dir + '/vocab_word', 'rb')
     vocab_word = pickle.load(t)
     t.close()
     print("========================word===========================")
@@ -741,9 +542,9 @@ def run_prediction(input_file_path, output_file_path):
     encoder = torch.nn.DataParallel(encoder).to(device_cuda)
     attn_decoder = torch.nn.DataParallel(attn_decoder).to(device_cuda)
 
-    embedding.load_state_dict(torch.load('model_copynet/embedding', map_location='cpu'))
-    encoder.load_state_dict(torch.load('model_copynet/encoder', map_location='cpu'))
-    attn_decoder.load_state_dict(torch.load('model_copynet/decoder', map_location='cpu'))
+    embedding.load_state_dict(torch.load(model_dir + '/embedding', map_location='cpu'))
+    encoder.load_state_dict(torch.load(model_dir + '/encoder', map_location='cpu'))
+    attn_decoder.load_state_dict(torch.load(model_dir + '/decoder', map_location='cpu'))
 
     input_data = open(input_file_path, encoding="utf-8").read().strip().split('\n')
     print(input_data)
@@ -751,11 +552,13 @@ def run_prediction(input_file_path, output_file_path):
     input_data = list(map(lambda x: sentence_with_kb(x), input_data))
     # 分词
     input_data = list(map(lambda x: word_tokenizer(x), input_data))
+    # 转换|QAQAQ
+    input_data = list(map(lambda x: cut_utterances(x, max_num_utterance, max_seq_length), input_data))
     print(input_data)
 
     decoded_words = []
     for s in input_data:
-        s = indexesFromSentence(vocab_word, s)
+        s = indexesFromSentenceInSeq(vocab_word, s)
         enc = [s]
         enc = torch.tensor(enc, dtype=torch.long, device=device_cuda)
         enc_lens = [len(s)]
